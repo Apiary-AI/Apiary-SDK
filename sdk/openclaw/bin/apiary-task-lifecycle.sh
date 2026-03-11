@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# apiary-task-lifecycle.sh — End-to-end task lifecycle for webhook_handler tasks.
+# apiary-task-lifecycle.sh — End-to-end task lifecycle for auto-processed tasks.
 #
 # The daemon polls pending tasks but previously never claimed, processed,
-# or completed them in Apiary.  This module closes the lifecycle:
+# or completed them in Apiary.  This module closes the lifecycle for
+# webhook_handler/reminder task types:
 #
-#   claim (atomic) → process via webhook wake → complete / fail → trace → cleanup
+#   claim (atomic) → process → complete / fail → trace → cleanup
 #
 # Designed to be sourced by apiary-daemon.sh.  All functions are fail-soft
 # at the daemon level (never crash the main loop), but individual failures
@@ -297,9 +298,206 @@ _lifecycle_process_webhook_handler() {
     return 0
 }
 
+
+# ── Reminder lifecycle ────────────────────────────────────────
+
+# Parse reminder payload from task JSON.
+# Supports both direct payload fields and schedule-style task_payload nesting:
+#   payload.channel / payload.target / payload.message
+#   payload.task_payload.channel / payload.task_payload.target / payload.task_payload.message
+#
+# Outputs JSON: {"channel":"...","target":"...","message":"..."}
+_lifecycle_parse_reminder_payload() {
+    local task_json="$1"
+    echo "$task_json" | jq -c '
+        (.payload // {}) as $p
+        | ($p.task_payload // {}) as $tp
+        | {
+            channel: (($p.channel // $tp.channel // "") | tostring | gsub("^\\s+|\\s+$"; "")),
+            target:  (($p.target  // $tp.target  // "") | tostring | gsub("^\\s+|\\s+$"; "")),
+            message: (($p.message // $tp.message // "") | tostring | gsub("^\\s+|\\s+$"; ""))
+          }
+    ' 2>/dev/null
+}
+
+# Process a reminder task through the full lifecycle.
+#
+# Steps:
+#   1. Claim task atomically (409 = another agent got it → skip)
+#   2. Parse + validate channel/target/message
+#   3. Deliver via openclaw message.send bridge (_wake_send_alert)
+#   4. Complete or fail the task in Apiary
+#   5. Write a local trace record
+#   6. Remove from pending directory
+#
+# Returns:
+#   0 — terminal outcome recorded (completed/failed/conflict-skipped)
+#   1 — transient API error (retry next poll)
+_lifecycle_process_reminder() {
+    local task_json="${1:-}"
+    local task_id="${2:-}"
+    local hive_id="${APIARY_HIVE_ID:-}"
+    local pending_dir="${PENDING_DIR:-${_LIFECYCLE_CONFIG_DIR}/pending}"
+
+    if [[ -z "$task_id" ]]; then
+        _wake_log "WARN" "lifecycle: reminder empty task_id; skipping"
+        return 0
+    fi
+
+    if [[ -z "$hive_id" ]]; then
+        _wake_log "WARN" "lifecycle: reminder APIARY_HIVE_ID not set; skipping task ${task_id}"
+        return 0
+    fi
+
+    # ── Step 0: Retry saved terminal result when available ────
+    local result_artifact="${pending_dir}/${task_id}.result.json"
+    if [[ -f "$result_artifact" ]]; then
+        _wake_log "INFO" "lifecycle: reminder found result artifact for task ${task_id}; retrying terminal API call"
+        local saved_status saved_result
+        saved_status=$(jq -r '.status // "completed"' < "$result_artifact" 2>/dev/null) || saved_status="completed"
+        saved_result=$(cat "$result_artifact" 2>/dev/null) || saved_result="{}"
+
+        local api_rc=0
+        if [[ "$saved_status" == "failed" ]]; then
+            apiary_fail_task "$hive_id" "$task_id" -e "$saved_result" >/dev/null 2>&1 || api_rc=$?
+        else
+            apiary_complete_task "$hive_id" "$task_id" -r "$saved_result" >/dev/null 2>&1 || api_rc=$?
+        fi
+
+        if [[ $api_rc -eq 0 ]] || [[ $api_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            _wake_log "INFO" "lifecycle: reminder terminal retry reconciled for task ${task_id}"
+            _lifecycle_write_trace "$task_id" "$saved_result"
+            rm -f "$result_artifact"
+            rm -f "${pending_dir}/${task_id}.json"
+            rm -f "${pending_dir}/${task_id}.claimed"
+            return 0
+        fi
+
+        _wake_log "WARN" "lifecycle: reminder terminal API retry still failing for task ${task_id}; preserving"
+        return 1
+    fi
+
+    # ── Step 1: Atomic claim ──────────────────────────────────
+    local claim_rc=0
+    local claimed_marker="${pending_dir}/${task_id}.claimed"
+    apiary_claim_task "$hive_id" "$task_id" >/dev/null 2>&1 || claim_rc=$?
+
+    if [[ $claim_rc -ne 0 ]]; then
+        if [[ $claim_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            if [[ -f "$claimed_marker" ]]; then
+                _wake_log "WARN" "lifecycle: reminder task ${task_id} 409 with local .claimed marker; reporting failure to release"
+                local release_rc=0
+                apiary_fail_task "$hive_id" "$task_id" -e \
+                    '{"error":"daemon recovery: lost result artifact after claim"}' >/dev/null 2>&1 || release_rc=$?
+                if [[ $release_rc -eq 0 ]] || [[ $release_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+                    rm -f "$claimed_marker"
+                    rm -f "${pending_dir}/${task_id}.json"
+                    return 0
+                fi
+                _wake_log "WARN" "lifecycle: reminder release/fail API error for task ${task_id} (rc=${release_rc}); preserving markers for retry"
+                return 1
+            fi
+
+            _wake_log "WARN" "lifecycle: reminder task ${task_id} got 409 without .claimed marker; quarantining for recovery"
+            mkdir -p "${pending_dir}/quarantine" 2>/dev/null || true
+            mv -f "${pending_dir}/${task_id}.json" "${pending_dir}/quarantine/${task_id}.json" 2>/dev/null || true
+            return 0
+        fi
+
+        _wake_log "WARN" "lifecycle: reminder failed to claim task ${task_id} (rc=${claim_rc}); will retry"
+        return 1
+    fi
+
+    echo "$task_id" > "$claimed_marker" 2>/dev/null || true
+    _wake_log "INFO" "lifecycle: reminder claimed task ${task_id}"
+
+    # ── Step 2: Parse + validate + deliver ────────────────────
+    local process_status="completed"
+    local process_summary=""
+    local channel=""
+    local target=""
+    local reminder_message=""
+
+    local reminder_payload
+    if ! reminder_payload=$(_lifecycle_parse_reminder_payload "$task_json"); then
+        process_status="failed"
+        process_summary="validation failed: reminder payload is not parseable"
+    else
+        channel=$(echo "$reminder_payload" | jq -r '.channel // ""' 2>/dev/null) || channel=""
+        target=$(echo "$reminder_payload" | jq -r '.target // ""' 2>/dev/null) || target=""
+        reminder_message=$(echo "$reminder_payload" | jq -r '.message // ""' 2>/dev/null) || reminder_message=""
+
+        if [[ -z "$channel" ]] || [[ -z "$target" ]] || [[ -z "$reminder_message" ]]; then
+            process_status="failed"
+            process_summary="validation failed: payload requires non-empty channel, target, and message"
+            _wake_log "WARN" "lifecycle: reminder validation failed for ${task_id} (channel='${channel}' target='${target}' message_len=${#reminder_message})"
+        else
+            if _wake_send_alert "$target" "$channel" "$reminder_message"; then
+                process_summary="delivered reminder via ${channel} to ${target}"
+                _wake_log "INFO" "lifecycle: reminder delivered for ${task_id} via channel=${channel} target=${target}"
+            else
+                process_status="failed"
+                process_summary="delivery failed: message.send channel=${channel} target=${target}"
+                _wake_log "WARN" "lifecycle: reminder delivery failed for ${task_id} via channel=${channel} target=${target}"
+            fi
+        fi
+    fi
+
+    # ── Step 3: Complete or fail in Apiary ────────────────────
+    local now_ts
+    now_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')
+    local result_json
+
+    if [[ "$process_status" == "completed" ]]; then
+        result_json=$(jq -n \
+            --arg id "$task_id" \
+            --arg summary "$process_summary" \
+            --arg ch "$channel" \
+            --arg tgt "$target" \
+            --arg ts "$now_ts" \
+            '{"task_id":$id,"status":"completed","processed_by":"daemon","summary":$summary,"delivery":{"channel":$ch,"target":$tgt},"completed_at":$ts}' \
+            2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"completed\"}"
+
+        if apiary_complete_task "$hive_id" "$task_id" -r "$result_json" >/dev/null 2>&1; then
+            _wake_log "INFO" "lifecycle: reminder completed task ${task_id}: ${process_summary}"
+        else
+            _wake_log "WARN" "lifecycle: reminder task ${task_id} processed but completion API call failed; saving result artifact for retry"
+            echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            return 1
+        fi
+    else
+        result_json=$(jq -n \
+            --arg id "$task_id" \
+            --arg err "$process_summary" \
+            --arg ch "$channel" \
+            --arg tgt "$target" \
+            --arg ts "$now_ts" \
+            '{"task_id":$id,"status":"failed","error":$err,"delivery":{"channel":$ch,"target":$tgt},"failed_at":$ts}' \
+            2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"failed\"}"
+
+        if apiary_fail_task "$hive_id" "$task_id" -e "$result_json" >/dev/null 2>&1; then
+            _wake_log "INFO" "lifecycle: reminder failed task ${task_id}: ${process_summary}"
+        else
+            _wake_log "WARN" "lifecycle: reminder task ${task_id} fail API call failed; saving result artifact for retry"
+            echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # ── Step 4: Persist trace (only after successful API update) ──
+    _lifecycle_write_trace "$task_id" "$result_json"
+
+    # ── Step 5: Clean up pending file + all state markers ────
+    rm -f "${pending_dir}/${task_id}.json"
+    rm -f "${pending_dir}/${task_id}.result.json"
+    rm -f "${pending_dir}/${task_id}.claimed"
+
+    return 0
+}
+
 # ── Retry sweep for stuck pending tasks ──────────────────────
 
-# Retry any pending webhook_handler tasks that remain from prior polls.
+# Retry any pending auto-lifecycle tasks that remain from prior polls.
 # Called by the daemon on each poll cycle to unstick tasks whose claim
 # failed with a retryable error (network timeout, etc.).
 #
@@ -319,12 +517,19 @@ _lifecycle_retry_pending_handlers() {
         ptask_id=$(basename "$pending_file" .json)
         ptask_type=$(echo "$ptask_json" | jq -r '.type' 2>/dev/null) || continue
 
-        [[ "$ptask_type" == "webhook_handler" ]] || continue
-
-        _lifecycle_process_webhook_handler "$ptask_json" "$ptask_id" || true
-        # Count successful wake/alert deliveries from retry path
-        if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
-            _stats_wakes_sent=$(( ${_stats_wakes_sent:-0} + 1 ))
-        fi
+        case "$ptask_type" in
+            webhook_handler)
+                _lifecycle_process_webhook_handler "$ptask_json" "$ptask_id" || true
+                # Count successful wake/alert deliveries from retry path
+                if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
+                    _stats_wakes_sent=$(( ${_stats_wakes_sent:-0} + 1 ))
+                fi
+                ;;
+            reminder)
+                _lifecycle_process_reminder "$ptask_json" "$ptask_id" || true
+                ;;
+            *)
+                ;;
+        esac
     done
 }

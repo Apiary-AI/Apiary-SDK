@@ -252,7 +252,7 @@ main() {
                                     --mode now 2>/dev/null || true
                             fi
 
-                            # Process webhook_handler tasks through full lifecycle
+                            # Process auto-lifecycle task types through full lifecycle
                             # (claim → process → complete/fail → trace → cleanup)
                             if [[ "$task_type" == "webhook_handler" ]]; then
                                 _lifecycle_process_webhook_handler "$task_json" "$task_id" || true
@@ -260,6 +260,8 @@ main() {
                                 if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
                                     _stats_wakes_sent=$(( _stats_wakes_sent + 1 ))
                                 fi
+                            elif [[ "$task_type" == "reminder" ]]; then
+                                _lifecycle_process_reminder "$task_json" "$task_id" || true
                             fi
                         fi
                     done
@@ -271,7 +273,7 @@ main() {
             # Poll events (best-effort)
             apiary_oc_events_poll >/dev/null 2>&1 || true
 
-            # Retry any stuck pending webhook_handler tasks from prior polls.
+            # Retry any stuck pending auto-lifecycle tasks from prior polls.
             # If a prior claim failed transiently (network error), the pending
             # file was preserved — this sweep re-attempts lifecycle processing.
             _lifecycle_retry_pending_handlers
