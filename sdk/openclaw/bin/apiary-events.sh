@@ -7,7 +7,9 @@
 # Functions:
 #   apiary_oc_events_subscribe     — Subscribe to an event type
 #   apiary_oc_events_unsubscribe   — Unsubscribe from an event type
-#   apiary_oc_events_poll          — Poll for new events
+#   apiary_oc_events_poll_raw      — Poll for new events (raw JSON array)
+#   apiary_oc_events_commit_cursor — Persist event cursor after successful handling
+#   apiary_oc_events_poll          — Poll for new events (human-readable)
 #   apiary_oc_events_publish       — Publish an event
 #   apiary_oc_events_list          — List current subscriptions
 
@@ -106,8 +108,10 @@ apiary_oc_events_list() {
 }
 
 # ── Poll events ─────────────────────────────────────────────────
-# apiary_oc_events_poll — Poll for new events since last cursor.
-apiary_oc_events_poll() {
+# apiary_oc_events_poll_raw — Poll for new events since last cursor.
+# Outputs raw JSON array. Cursor is NOT advanced here; caller must commit
+# only after events are successfully handled.
+apiary_oc_events_poll_raw() {
     local hive_id="${APIARY_HIVE_ID:?APIARY_HIVE_ID must be set}"
 
     local params=()
@@ -123,15 +127,25 @@ apiary_oc_events_poll() {
     local result
     result=$(_apiary_request GET "/api/v1/hives/${hive_id}/events/poll${qs}") || return $?
 
+    echo "$result"
+    return $APIARY_OK
+}
+
+# apiary_oc_events_commit_cursor EVENT_ID — Persist cursor after successful handling.
+apiary_oc_events_commit_cursor() {
+    local event_id="${1:-}"
+    [[ -n "$event_id" ]] || return $APIARY_OK
+    _apiary_oc_save_cursor "$event_id"
+    return $APIARY_OK
+}
+
+# apiary_oc_events_poll — Human-readable wrapper around raw event polling.
+apiary_oc_events_poll() {
+    local result
+    result=$(apiary_oc_events_poll_raw) || return $?
+
     local count
     count=$(echo "$result" | jq 'if type == "array" then length else 0 end' 2>/dev/null || echo 0)
-
-    # Update cursor if we got events
-    if [[ "$count" -gt 0 ]]; then
-        local new_cursor
-        new_cursor=$(echo "$result" | jq -r '.[-1].id // empty' 2>/dev/null)
-        [[ -n "$new_cursor" ]] && _apiary_oc_save_cursor "$new_cursor"
-    fi
 
     if [[ "$count" -eq 0 ]]; then
         echo "No new events."
@@ -141,6 +155,11 @@ apiary_oc_events_poll() {
     echo "New events ($count):"
     echo ""
     echo "$result" | jq -r '.[] | "  [\(.id)] type=\(.type) from=\(.source_agent_id // "system") at=\(.created_at // "unknown")"'
+
+    # Human wrapper treats display as handling complete.
+    local new_cursor
+    new_cursor=$(echo "$result" | jq -r '.[-1].id // empty' 2>/dev/null)
+    [[ -n "$new_cursor" ]] && apiary_oc_events_commit_cursor "$new_cursor"
 
     return $APIARY_OK
 }

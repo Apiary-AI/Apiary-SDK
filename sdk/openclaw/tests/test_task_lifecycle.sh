@@ -54,6 +54,8 @@ _setup() {
 
     export PENDING_DIR="${_tmp_dir}/pending"
     mkdir -p "$PENDING_DIR"
+    rm -f "${PENDING_DIR}"/*.json 2>/dev/null || true
+    rm -rf "${PENDING_DIR}/quarantine" 2>/dev/null || true
 
     rm -f "${_tmp_dir}/wake_seen.json"
     rm -f "${_tmp_dir}/wake.log"
@@ -570,10 +572,10 @@ assert_eq "$([ -f "${PENDING_DIR}/retry-stuck.json" ] && echo exists || echo rem
 
 
 # ═══════════════════════════════════════════════════════════════
-# Retry sweep — skips non-webhook_handler tasks
+# Retry sweep — unknown task gets explicit capability_missing failure
 # ═══════════════════════════════════════════════════════════════
 
-describe "Retry sweep — skips non-webhook_handler pending tasks"
+describe "Retry sweep — unknown task type fails with capability_missing"
 
 _setup
 _CLAIM_RC=0
@@ -584,9 +586,167 @@ echo "$other_task" > "${PENDING_DIR}/other-type-1.json"
 
 _lifecycle_retry_pending_handlers
 
-assert_eq "$_CLAIM_CALLS" "0" "retry sweep: claim NOT called for non-webhook type"
-assert_eq "$([ -f "${PENDING_DIR}/other-type-1.json" ] && echo exists || echo removed)" "exists" \
-    "retry sweep: non-webhook pending file untouched"
+assert_eq "$_CLAIM_CALLS" "1" "retry sweep: claim called for unknown type"
+assert_eq "$_COMPLETE_CALLS" "0" "retry sweep: complete not called for unknown type"
+assert_eq "$_FAIL_CALLS" "1" "retry sweep: fail called for unknown type"
+trace_unknown=$(cat "${_tmp_dir}/traces/other-type-1.json" 2>/dev/null || echo "")
+assert_contains "$trace_unknown" "capability_missing" "retry sweep: trace includes capability_missing code"
+assert_contains "$trace_unknown" "code_review" "retry sweep: trace includes missing task type"
+assert_eq "$([ -f "${PENDING_DIR}/other-type-1.json" ] && echo exists || echo removed)" "removed" \
+    "retry sweep: unknown-type pending file removed after fail"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — unknown task includes invoke passthrough fields
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — unknown task preserves trusted invoke fields"
+
+_setup
+_CLAIM_RC=0
+
+other_task=$(jq -n '{
+    "id":"other-type-2",
+    "type":"triage",
+    "payload":{
+        "invoke":{
+            "instructions":"Handle this manually",
+            "context":{"ticket":"ABC-123","priority":"high"}
+        }
+    }
+}')
+echo "$other_task" > "${PENDING_DIR}/other-type-2.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep invoke: fail called"
+trace_invoke=$(cat "${_tmp_dir}/traces/other-type-2.json" 2>/dev/null || echo "{}")
+assert_eq "$(echo "$trace_invoke" | jq -r '.trusted_control_plane.invoke.instructions // empty')" "Handle this manually" \
+    "retry sweep invoke: instructions passed through"
+assert_eq "$(echo "$trace_invoke" | jq -r '.trusted_control_plane.invoke.context.ticket // empty')" "ABC-123" \
+    "retry sweep invoke: context passed through"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — top-level invoke takes precedence over payload.invoke
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — invoke precedence prefers top-level fields"
+
+_setup
+_CLAIM_RC=0
+
+other_task=$(jq -n '{
+    "id":"other-type-3",
+    "type":"triage",
+    "invoke":{
+        "instructions":"Use top-level instructions",
+        "context":{"ticket":"TOP-999","source":"top"}
+    },
+    "payload":{
+        "invoke":{
+            "instructions":"Legacy payload instructions",
+            "context":{"ticket":"LEGACY-111","source":"payload"}
+        }
+    }
+}')
+echo "$other_task" > "${PENDING_DIR}/other-type-3.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep precedence: fail called"
+trace_invoke_top=$(cat "${_tmp_dir}/traces/other-type-3.json" 2>/dev/null || echo "{}")
+assert_eq "$(echo "$trace_invoke_top" | jq -r '.trusted_control_plane.invoke.instructions // empty')" "Use top-level instructions" \
+    "retry sweep precedence: top-level instructions win"
+assert_eq "$(echo "$trace_invoke_top" | jq -r '.trusted_control_plane.invoke.context.ticket // empty')" "TOP-999" \
+    "retry sweep precedence: top-level context wins"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — unknown task 409 with owned marker retries fail
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — unknown task 409 with verified .claimed retries terminal fail"
+
+_setup
+_CLAIM_RC=${APIARY_ERR_CONFLICT:-6}
+
+owned_task=$(jq -n '{"id":"other-type-conflict-owned","type":"triage","payload":{}}')
+echo "$owned_task" > "${PENDING_DIR}/other-type-conflict-owned.json"
+_lifecycle_write_claimed_marker "${PENDING_DIR}/other-type-conflict-owned.claimed" "other-type-conflict-owned"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep conflict-owned: fail called for recovery"
+assert_eq "$([ -f "${PENDING_DIR}/other-type-conflict-owned.json" ] && echo exists || echo removed)" "removed" \
+    "retry sweep conflict-owned: pending file removed after terminal fail"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — unknown task 409 without marker quarantines
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — unknown task 409 without .claimed quarantines for recovery"
+
+_setup
+_CLAIM_RC=${APIARY_ERR_CONFLICT:-6}
+
+conflict_task=$(jq -n '{"id":"other-type-conflict-no-marker","type":"triage","payload":{}}')
+echo "$conflict_task" > "${PENDING_DIR}/other-type-conflict-no-marker.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "0" "retry sweep conflict-no-marker: fail not called"
+assert_eq "$([ -f "${PENDING_DIR}/quarantine/other-type-conflict-no-marker.json" ] && echo exists || echo missing)" "exists" \
+    "retry sweep conflict-no-marker: pending file moved to quarantine"
+
+
+describe "Retry sweep — unknown task 409 with stale-but-owned marker retries terminal fail"
+
+_setup
+_CLAIM_RC=${APIARY_ERR_CONFLICT:-6}
+APIARY_CLAIM_TTL=1
+
+stale_owned_task=$(jq -n '{"id":"other-type-conflict-stale-owned","type":"triage","payload":{}}')
+echo "$stale_owned_task" > "${PENDING_DIR}/other-type-conflict-stale-owned.json"
+_lifecycle_write_claimed_marker "${PENDING_DIR}/other-type-conflict-stale-owned.claimed" "other-type-conflict-stale-owned"
+touch -d "2 minutes ago" "${PENDING_DIR}/other-type-conflict-stale-owned.claimed" 2>/dev/null || true
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep conflict-stale-owned: fail called for terminal reconciliation"
+assert_eq "$([ -f "${PENDING_DIR}/other-type-conflict-stale-owned.json" ] && echo exists || echo removed)" "removed" \
+    "retry sweep conflict-stale-owned: pending file removed after terminal fail"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — unknown task fail 409 reconciles as terminal
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — unknown task fail 409 is reconciled and cleaned up"
+
+_setup
+_CLAIM_RC=0
+
+apiary_fail_task() {
+    local hive_id="$1"
+    local task_id="$2"
+    shift 2
+    _FAIL_CALLS=$((_FAIL_CALLS + 1))
+    _FAIL_LAST_TASK="$task_id"
+    return ${APIARY_ERR_CONFLICT:-6}
+}
+
+conflict_terminal_task=$(jq -n '{"id":"other-type-fail-409","type":"triage","payload":{}}')
+echo "$conflict_terminal_task" > "${PENDING_DIR}/other-type-fail-409.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep fail-409: fail attempted"
+assert_eq "$([ -f "${PENDING_DIR}/other-type-fail-409.json" ] && echo exists || echo removed)" "removed" \
+    "retry sweep fail-409: pending file removed after reconciliation"
+trace_fail_409=$(cat "${_tmp_dir}/traces/other-type-fail-409.json" 2>/dev/null || echo "")
+assert_contains "$trace_fail_409" "capability_missing" "retry sweep fail-409: trace persisted on reconciliation"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1586,6 +1746,23 @@ echo "$task_json" > "${PENDING_DIR}/retry-claimfail.json"
 _lifecycle_retry_pending_handlers
 
 assert_eq "${_stats_wakes_sent}" "0" "retry-claimfail: _stats_wakes_sent stays 0 on claim failure"
+
+
+describe "Retry sweep — non-webhook task does not inherit stale wake-delivered flag"
+
+_setup
+_CLAIM_RC=0
+_stats_wakes_sent=0
+rm -f "${PENDING_DIR}"/*.json 2>/dev/null || true
+
+task1=$(_make_pr_comment_task "retry-mixed-webhook" 11006 "org/mixed" 6 "Webhook first")
+task2=$(jq -n '{"id":"retry-mixed-unknown","type":"triage","payload":{}}')
+echo "$task1" > "${PENDING_DIR}/retry-mixed-webhook.json"
+echo "$task2" > "${PENDING_DIR}/retry-mixed-unknown.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "${_stats_wakes_sent}" "1" "retry-mixed: wakes_sent increments only for webhook delivery"
 
 
 # ═══════════════════════════════════════════════════════════════

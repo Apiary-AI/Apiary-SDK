@@ -106,7 +106,7 @@ _cli_login_usage() {
 }
 
 _cli_task_create_usage() {
-    echo "Usage: apiary-cli task-create HIVE_ID -t TYPE [-p PRIORITY] [-a TARGET_AGENT_ID] [-c TARGET_CAPABILITY] [-d PAYLOAD_JSON] [-T TIMEOUT] [-r MAX_RETRIES]"
+    echo "Usage: apiary-cli task-create HIVE_ID -t TYPE [-p PRIORITY] [-a TARGET_AGENT_ID] [-c TARGET_CAPABILITY] [-d PAYLOAD_JSON] [-T TIMEOUT] [-r MAX_RETRIES] [-P PARENT_TASK_ID] [-x CONTEXT_REFS_JSON] [-g GUARANTEE] [-e EXPIRES_AT] [-I INVOKE_INSTRUCTIONS] [-X INVOKE_CONTEXT_JSON]"
 }
 
 if [[ $# -lt 1 ]]; then

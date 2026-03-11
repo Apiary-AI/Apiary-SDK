@@ -50,6 +50,26 @@ assert_eq "$(echo "$body" | jq -r '.payload.input')" "data" "create_task sends p
 assert_eq "$(echo "$body" | jq '.timeout_seconds')" "300" "create_task sends timeout_seconds"
 assert_eq "$(echo "$body" | jq '.max_retries')" "5" "create_task sends max_retries"
 
+# Create task with first-class invoke fields (and legacy payload passthrough)
+mock_reset
+mock_response POST "/api/v1/hives/${HIVE}/tasks" 200 \
+    '{"data":{"id":"'"$TASK"'","type":"process","priority":1},"meta":{},"errors":null}'
+
+apiary_create_task "$HIVE" -t "process" \
+    -d '{"invoke":{"instructions":"legacy payload instructions","context":{"origin":"payload"}}}' \
+    -I "first-class instructions" \
+    -X '{"origin":"top-level","attempt":2}' >/dev/null
+
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.payload.invoke.instructions')" "legacy payload instructions" \
+    "create_task preserves payload.invoke.instructions passthrough"
+assert_eq "$(echo "$body" | jq -r '.invoke.instructions')" "first-class instructions" \
+    "create_task sends invoke.instructions as top-level field"
+assert_eq "$(echo "$body" | jq -r '.invoke.context.origin')" "top-level" \
+    "create_task sends invoke.context as top-level field"
+assert_eq "$(echo "$body" | jq '.invoke.context.attempt')" "2" \
+    "create_task sends invoke.context JSON payload"
+
 # ── Poll tasks ───────────────────────────────────────────────────
 
 describe "apiary_poll_tasks"

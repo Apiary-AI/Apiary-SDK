@@ -166,6 +166,88 @@ _daemon_save_pending_task() {
     echo "$task_json" > "${PENDING_DIR}/${task_id}.json"
 }
 
+_daemon_save_pending_event() {
+    local event_json="$1"
+    local event_id
+    event_id=$(echo "$event_json" | jq -r '.id // empty' 2>/dev/null) || event_id=""
+    [[ -n "$event_id" ]] || return 0
+
+    local events_dir="${PENDING_DIR}/events"
+    mkdir -p "$events_dir"
+    echo "$event_json" > "${events_dir}/${event_id}.json"
+}
+
+_daemon_process_routed_task() {
+    local task_json="$1"
+    local task_id="$2"
+    local task_type="$3"
+
+    _lifecycle_process_routed_task "$task_json" "$task_id" "$task_type" || true
+
+    # Only webhook_handler path sets this sentinel when a wake/alert was delivered.
+    if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
+        _stats_wakes_sent=$(( _stats_wakes_sent + 1 ))
+    fi
+}
+
+_daemon_process_polled_events() {
+    local hive_id="${APIARY_HIVE_ID:-}"
+    [[ -n "$hive_id" ]] || return 0
+
+    local events
+    events=$(apiary_oc_events_poll_raw 2>/dev/null) || return 0
+
+    local count
+    count=$(echo "$events" | jq 'if type == "array" then length else 0 end' 2>/dev/null || echo 0)
+    [[ "$count" -gt 0 ]] || return 0
+
+    local i
+    for i in $(seq 0 $(( count - 1 ))); do
+        local event_json event_id event_type
+        event_json=$(echo "$events" | jq -c ".[${i}]" 2>/dev/null) || continue
+        event_id=$(echo "$event_json" | jq -r '.id // empty' 2>/dev/null) || event_id=""
+        event_type=$(echo "$event_json" | jq -r '.type // "unknown"' 2>/dev/null) || event_type="unknown"
+
+        [[ -n "$event_id" ]] || continue
+
+        _daemon_save_pending_event "$event_json"
+        echo "[apiary-daemon] New event: ${event_id} (type: ${event_type})" >&2
+
+        local dispatch_ok=1
+
+        # Notify OpenClaw via system event.
+        # If dispatch fails (including missing CLI), do NOT advance cursor
+        # and do NOT prune snapshot.
+        if command -v openclaw >/dev/null 2>&1; then
+            if ! openclaw system event \
+                --text "apiary:event:${event_type}:${event_id}" \
+                --mode now 2>/dev/null; then
+                dispatch_ok=0
+                echo "[apiary-daemon] Event dispatch failed for ${event_id}; preserving snapshot for retry" >&2
+            fi
+        else
+            dispatch_ok=0
+            echo "[apiary-daemon] openclaw command not found; preserving event ${event_id} for retry" >&2
+        fi
+
+        if [[ $dispatch_ok -ne 1 ]]; then
+            # Critical: stop processing this polled batch on first dispatch failure.
+            # Otherwise a later successful cursor commit could skip the failed event.
+            break
+        fi
+
+        # Advance cursor only after this event is successfully handled.
+        if apiary_oc_events_commit_cursor "$event_id"; then
+            # Event is durably acknowledged via cursor commit; prune local snapshot
+            # to avoid unbounded disk growth in long-running daemons.
+            rm -f "${PENDING_DIR}/events/${event_id}.json" 2>/dev/null || true
+        else
+            echo "[apiary-daemon] Cursor commit failed for ${event_id}; preserving snapshot for retry" >&2
+            break
+        fi
+    done
+}
+
 # ── Main loop ───────────────────────────────────────────────────
 
 main() {
@@ -252,17 +334,9 @@ main() {
                                     --mode now 2>/dev/null || true
                             fi
 
-                            # Process auto-lifecycle task types through full lifecycle
-                            # (claim → process → complete/fail → trace → cleanup)
-                            if [[ "$task_type" == "webhook_handler" ]]; then
-                                _lifecycle_process_webhook_handler "$task_json" "$task_id" || true
-                                # Only count wakes that were actually delivered
-                                if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
-                                    _stats_wakes_sent=$(( _stats_wakes_sent + 1 ))
-                                fi
-                            elif [[ "$task_type" == "reminder" ]]; then
-                                _lifecycle_process_reminder "$task_json" "$task_id" || true
-                            fi
+                            # Always route every polled task through lifecycle dispatch.
+                            # Unknown task types are explicitly failed with capability_missing.
+                            _daemon_process_routed_task "$task_json" "$task_id" "$task_type"
                         fi
                     done
                 fi
@@ -270,8 +344,8 @@ main() {
                 _stats_errors=$(( _stats_errors + 1 ))
             fi
 
-            # Poll events (best-effort)
-            apiary_oc_events_poll >/dev/null 2>&1 || true
+            # Poll and surface events (best-effort, no silent drop)
+            _daemon_process_polled_events || true
 
             # Retry any stuck pending auto-lifecycle tasks from prior polls.
             # If a prior claim failed transiently (network error), the pending
