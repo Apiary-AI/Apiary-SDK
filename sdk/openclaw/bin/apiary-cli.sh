@@ -69,8 +69,9 @@ Environment:
   APIARY_BASE_URL        API base URL (required)
   APIARY_HIVE_ID         Target hive ID
   APIARY_AGENT_NAME      Agent name (for registration)
-  APIARY_AGENT_SECRET    Shared secret
+  APIARY_AGENT_SECRET    Shared secret (register/login fallback)
   APIARY_AGENT_ID        Agent ID (set after first registration)
+  APIARY_AGENT_REFRESH_TOKEN  Refresh token for secret-less renewal
   APIARY_CAPABILITIES    Comma-separated capabilities (default: general)
   APIARY_POLL_INTERVAL   Daemon poll interval in seconds (default: 10)
   APIARY_HEARTBEAT_INTERVAL  Heartbeat interval in seconds (default: 30)
@@ -82,9 +83,11 @@ EOF
 # ── Status command ──────────────────────────────────────────────
 
 _oc_status() {
+    _apiary_oc_sync_token_file
     apiary_load_token
     source "${SCRIPT_DIR}/apiary-auth.sh"
     _apiary_oc_load_agent
+    _apiary_oc_load_refresh_token
 
     echo "Apiary Agent Status"
     echo "==================="
@@ -96,6 +99,11 @@ _oc_status() {
         echo "  Token:       <set> (masked)"
     else
         echo "  Token:       <not set>"
+    fi
+    if [[ -n "${APIARY_AGENT_REFRESH_TOKEN:-}" ]]; then
+        echo "  Refresh:     <set> (masked)"
+    else
+        echo "  Refresh:     <not set>"
     fi
 
     # Check daemon status

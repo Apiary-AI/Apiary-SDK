@@ -7,7 +7,8 @@
 # Dependencies: bash 4+, curl, jq
 # Env vars:
 #   APIARY_BASE_URL  — API base URL (required, no trailing slash)
-#   APIARY_TOKEN     — Bearer token (set automatically by apiary_register/apiary_login)
+#   APIARY_TOKEN     — Bearer token (set automatically by auth helpers)
+#   APIARY_AGENT_REFRESH_TOKEN — Agent refresh token (set by register/login/refresh helpers)
 #   APIARY_TIMEOUT   — Request timeout in seconds (default: 30)
 #   APIARY_TOKEN_FILE — Path to persisted token file (default: ~/.config/apiary/token)
 #   APIARY_DEBUG     — Set to 1 for verbose curl output on stderr
@@ -241,8 +242,9 @@ apiary_register() {
     local result
     result=$(_apiary_request POST "/api/v1/agents/register" "$body") || return $?
 
-    # Auto-store the token
+    # Auto-store auth credentials
     APIARY_TOKEN=$(echo "$result" | jq -r '.token // empty')
+    APIARY_AGENT_REFRESH_TOKEN=$(echo "$result" | jq -r '.refresh_token // empty')
     echo "$result"
     return $APIARY_OK
 }
@@ -272,6 +274,37 @@ apiary_login() {
     result=$(_apiary_request POST "/api/v1/agents/login" "$body") || return $?
 
     APIARY_TOKEN=$(echo "$result" | jq -r '.token // empty')
+    APIARY_AGENT_REFRESH_TOKEN=$(echo "$result" | jq -r '.refresh_token // empty')
+    echo "$result"
+    return $APIARY_OK
+}
+
+# apiary_refresh_agent_token — refresh an expired/expiring token without the agent secret.
+#   -i AGENT_ID  -r REFRESH_TOKEN
+apiary_refresh_agent_token() {
+    local agent_id="" refresh_token=""
+    local OPTIND OPTARG opt
+    while getopts "i:r:" opt; do
+        case "$opt" in
+            i) agent_id="$OPTARG" ;;
+            r) refresh_token="$OPTARG" ;;
+            *) _apiary_err "refresh_agent_token: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$agent_id" || -z "$refresh_token" ]]; then
+        _apiary_err "refresh_agent_token: -i AGENT_ID and -r REFRESH_TOKEN are required"
+        return $APIARY_ERR
+    fi
+
+    local body
+    body=$(_apiary_build_json "agent_id" "$agent_id" "refresh_token" "$refresh_token") || return $APIARY_ERR
+
+    local result
+    result=$(_apiary_request POST "/api/v1/agents/token/refresh" "$body") || return $?
+
+    APIARY_TOKEN=$(echo "$result" | jq -r '.token // empty')
+    APIARY_AGENT_REFRESH_TOKEN=$(echo "$result" | jq -r '.refresh_token // empty')
     echo "$result"
     return $APIARY_OK
 }
@@ -419,6 +452,9 @@ apiary_rotate_key() {
     result=$(_apiary_request POST "/api/v1/agents/key/rotate" "$body") || return $?
 
     APIARY_TOKEN=$(echo "$result" | jq -r '.token // empty')
+    APIARY_AGENT_REFRESH_TOKEN=$(echo "$result" | jq -r '.refresh_token // empty')
+    export APIARY_TOKEN APIARY_AGENT_REFRESH_TOKEN
+
     echo "$result"
     return $APIARY_OK
 }

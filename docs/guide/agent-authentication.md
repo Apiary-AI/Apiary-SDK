@@ -38,14 +38,16 @@ Agent (external process)              Apiary Platform
 
 ### Two Layers of Hashing
 
-Apiary stores **two** hashed values per agent:
+Apiary stores **three** hashed credentials per agent:
 
 1. **`agents.api_token_hash`** — bcrypt hash of the agent's registration
    **secret**. Used during `/login` to verify identity.
-2. **`personal_access_tokens.token`** — SHA-256 hash of the Sanctum bearer
+2. **`agents.refresh_token_hash`** — bcrypt hash of the rotating refresh token.
+   Used by `/token/refresh` for secret-less token renewal.
+3. **`personal_access_tokens.token`** — SHA-256 hash of the Sanctum bearer
    **token**. Used on every authenticated request to resolve the agent.
 
-Neither the secret nor the bearer token is ever stored in plaintext.
+Neither the secret nor the issued tokens are stored in plaintext.
 
 ## Endpoints
 
@@ -53,9 +55,10 @@ All endpoints live under the `/api/v1/agents` prefix.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/register` | None | Create agent and receive token |
-| `POST` | `/login` | None | Authenticate and receive new token |
-| `POST` | `/logout` | Bearer | Revoke current token |
+| `POST` | `/register` | None | Create agent and receive access + refresh tokens |
+| `POST` | `/login` | None | Authenticate and receive a new access + refresh pair |
+| `POST` | `/token/refresh` | None (throttled) | Rotate access token using agent refresh token |
+| `POST` | `/logout` | Bearer | Revoke current access token |
 | `GET`  | `/me` | Bearer | Return authenticated agent info |
 
 ### POST /api/v1/agents/register
@@ -98,7 +101,8 @@ Create a new agent in a hive and receive a Sanctum bearer token.
       "status": "offline",
       "capabilities": ["deploy", "rollback"]
     },
-    "token": "1|abc123def456ghi789..."
+    "token": "1|abc123def456ghi789...",
+    "refresh_token": "rt_..."
   },
   "meta": {},
   "errors": null
@@ -106,8 +110,8 @@ Create a new agent in a hive and receive a Sanctum bearer token.
 ```
 
 ::: tip
-Store the `token` value immediately — it is shown only once. Apiary stores
-only a SHA-256 hash internally.
+Store both `token` and `refresh_token` immediately — each is shown only once.
+Apiary stores only hashed values internally.
 :::
 
 ### POST /api/v1/agents/login
@@ -143,7 +147,8 @@ explicitly revoked.
       "apiary_id": "01JFQABC01JFQABC01JFQABC01",
       "status": "offline"
     },
-    "token": "2|xyz789uvw012..."
+    "token": "2|xyz789uvw012...",
+    "refresh_token": "rt_..."
   },
   "meta": {},
   "errors": null
@@ -162,6 +167,41 @@ explicitly revoked.
       "code": "auth_failed"
     }
   ]
+}
+```
+
+### POST /api/v1/agents/token/refresh
+
+Rotate credentials without the shared secret using `agent_id` + `refresh_token`.
+Use this path for UI-managed agents where only token credentials are provided.
+
+**Request:**
+
+```json
+{
+  "agent_id": "01JFZ123ABC456DEF789GHI012",
+  "refresh_token": "rt_..."
+}
+```
+
+**Response — 200 OK:**
+
+```json
+{
+  "data": {
+    "agent": {
+      "id": "01JFZ123ABC456DEF789GHI012",
+      "name": "DeployBot",
+      "type": "deployment",
+      "hive_id": "01JFWXYZ01JFWXYZ01JFWXYZ01",
+      "apiary_id": "01JFQABC01JFQABC01JFQABC01",
+      "status": "offline"
+    },
+    "token": "3|new-access-token...",
+    "refresh_token": "rt_new..."
+  },
+  "meta": {},
+  "errors": null
 }
 ```
 
@@ -219,17 +259,18 @@ A typical agent lifecycle looks like this:
 
 ```text
 1. Agent starts up
-2. POST /api/v1/agents/register   (first run)
-   — or —
-   POST /api/v1/agents/login      (subsequent runs)
-3. Store bearer token in memory
-4. Loop:
+2. Validate current bearer token (`GET /api/v1/agents/me`)
+3. If invalid:
+   - `POST /api/v1/agents/token/refresh` (preferred UI-managed path)
+   - or `POST /api/v1/agents/login` / `POST /api/v1/agents/register` (secret fallback)
+4. Store rotated `token` + `refresh_token`
+5. Loop:
      GET  /api/v1/agents/me         (health check / heartbeat)
      GET  /api/v1/tasks?status=pending  (claim work)
      POST /api/v1/tasks/{id}/claim
      ... perform work ...
      PUT  /api/v1/tasks/{id}/result
-5. POST /api/v1/agents/logout      (graceful shutdown)
+6. POST /api/v1/agents/logout      (graceful shutdown)
 ```
 
 ### Example: Python Agent Bootstrap
@@ -281,19 +322,20 @@ curl -X POST https://apiary.example.com/api/v1/agents/logout \
 
 ### Creation
 
-Tokens are created during **register** and **login**. Each call produces a new
-independent token. An agent can hold multiple valid tokens simultaneously (e.g.
-across restarts or parallel instances).
+Credential pairs (`token` + `refresh_token`) are issued during **register**,
+**login**, and **token refresh**. Access tokens can be multiple/parallel;
+refresh token is rotated on each issuance and only the latest one remains valid.
 
 ### Storage
 
 | What | Where | Hash |
 |------|-------|------|
 | Agent secret | `agents.api_token_hash` | bcrypt |
+| Refresh token | `agents.refresh_token_hash` | bcrypt |
 | Bearer token | `personal_access_tokens.token` | SHA-256 |
 
-The plaintext bearer token is returned exactly once in the register/login
-response. Apiary never stores or logs it.
+Plaintext access/refresh tokens are returned exactly once in auth responses.
+Apiary never stores or logs them.
 
 ### Revocation
 
@@ -445,25 +487,29 @@ Common validation issues:
 | `hive_id` | 26-char ULID, must exist | Wrong length, non-existent hive |
 | `secret` | min 16 characters | Too short — use a strong passphrase or generated key |
 
-### Token Shown Only Once
+### Tokens Shown Only Once
 
-The plaintext bearer token is returned **only** in the register/login response.
-If lost, call `/login` again to generate a new token. The old token remains
-valid until revoked.
+Plaintext `token` and `refresh_token` values are returned **only** in auth
+responses. If lost, call `/login` (or re-connect via dashboard) to mint a new
+pair. Previous access tokens remain valid until revoked.
 
-### Multiple Tokens per Agent
+### Multiple Access Tokens per Agent
 
-Each `/login` call creates a **new** token without revoking previous ones. This
-is by design — it allows parallel agent instances to hold independent tokens.
+Each `/login` call creates a **new** access token without revoking previous
+ones. This allows parallel agent instances to hold independent access tokens.
 To clean up stale tokens, revoke them via `/logout` or the admin dashboard.
+
+Refresh tokens are different: only the latest refresh token is valid for an
+agent, and it rotates whenever a new auth pair is issued.
 
 ## Testing and Validation
 
 The test suite for agent authentication is in
 `tests/Feature/AgentAuthTest.php`. It covers:
 
-- **Registration flow** — agent creation, token issuance, hashed storage
-- **Login flow** — credential verification, new token per login
+- **Registration flow** — agent creation, auth pair issuance, hashed storage
+- **Login flow** — credential verification, new auth pair per login
+- **Refresh flow** — token renewal with `agent_id` + `refresh_token`
 - **Protected endpoints** — 401 without token, 401 with invalid token
 - **Logout and revocation** — token invalidation, isolation between tokens
 - **Activity logging** — correct action strings and metadata

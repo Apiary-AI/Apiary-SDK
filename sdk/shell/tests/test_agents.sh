@@ -18,12 +18,17 @@ describe "apiary_register"
 
 mock_reset
 mock_response POST "/api/v1/agents/register" 200 \
-    '{"data":{"agent":{"id":"agent-1","name":"my-bot","type":"custom","hive_id":"'"$HIVE"'"},"token":"tok-123"},"meta":{},"errors":null}'
+    '{"data":{"agent":{"id":"agent-1","name":"my-bot","type":"custom","hive_id":"'"$HIVE"'"},"token":"tok-123","refresh_token":"rt-123"},"meta":{},"errors":null}'
 
 APIARY_TOKEN=""
+APIARY_AGENT_REFRESH_TOKEN=""
 result=$(apiary_register -n "my-bot" -h "$HIVE" -s "ssssssssssssssss" -t "custom")
 assert_eq "$(echo "$result" | jq -r '.agent.name')" "my-bot" "register returns agent name"
 assert_eq "$(echo "$result" | jq -r '.token')" "tok-123" "register returns token"
+
+APIARY_AGENT_REFRESH_TOKEN=""
+apiary_register -n "my-bot" -h "$HIVE" -s "ssssssssssssssss" -t "custom" >/dev/null
+assert_eq "$APIARY_AGENT_REFRESH_TOKEN" "rt-123" "register stores refresh token"
 
 body=$(mock_last_body)
 assert_eq "$(echo "$body" | jq -r '.name')" "my-bot" "register sends name in body"
@@ -36,7 +41,7 @@ assert_eq "$method" "POST" "register uses POST method"
 # Register with optional fields
 mock_reset
 mock_response POST "/api/v1/agents/register" 200 \
-    '{"data":{"agent":{"id":"agent-2"},"token":"tok-456"},"meta":{},"errors":null}'
+    '{"data":{"agent":{"id":"agent-2"},"token":"tok-456","refresh_token":"rt-456"},"meta":{},"errors":null}'
 
 APIARY_TOKEN=""
 apiary_register -n "bot2" -h "$HIVE" -s "ssssssssssssssss" \
@@ -52,16 +57,19 @@ describe "apiary_login"
 
 mock_reset
 mock_response POST "/api/v1/agents/login" 200 \
-    '{"data":{"agent":{"id":"agent-1"},"token":"tok-login"},"meta":{},"errors":null}'
+    '{"data":{"agent":{"id":"agent-1"},"token":"tok-login","refresh_token":"rt-login"},"meta":{},"errors":null}'
 
 APIARY_TOKEN=""
+APIARY_AGENT_REFRESH_TOKEN=""
 result=$(apiary_login -i "agent-1" -s "secret123456789a")
 assert_eq "$(echo "$result" | jq -r '.token')" "tok-login" "login returns token"
 
-# Token storage must be tested without $() subshell
+# Credential storage must be tested without $() subshell
 APIARY_TOKEN=""
+APIARY_AGENT_REFRESH_TOKEN=""
 apiary_login -i "agent-1" -s "secret123456789a" >/dev/null
 assert_eq "$APIARY_TOKEN" "tok-login" "login stores token"
+assert_eq "$APIARY_AGENT_REFRESH_TOKEN" "rt-login" "login stores refresh token"
 
 body=$(mock_last_body)
 assert_eq "$(echo "$body" | jq -r '.agent_id')" "agent-1" "login sends agent_id"
@@ -70,13 +78,60 @@ assert_eq "$(echo "$body" | jq -r '.secret')" "secret123456789a" "login sends se
 # Login with a numeric-looking secret — must stay a string
 mock_reset
 mock_response POST "/api/v1/agents/login" 200 \
-    '{"data":{"agent":{"id":"agent-1"},"token":"tok-num"},"meta":{},"errors":null}'
+    '{"data":{"agent":{"id":"agent-1"},"token":"tok-num","refresh_token":"rt-num"},"meta":{},"errors":null}'
 
 APIARY_TOKEN=""
 apiary_login -i "agent-1" -s "9999999999999999" >/dev/null
 body=$(mock_last_body)
 assert_eq "$(echo "$body" | jq -r '.secret')" "9999999999999999" "numeric-looking secret value preserved"
 assert_eq "$(echo "$body" | jq -r '.secret | type')" "string" "numeric-looking secret stays JSON string type"
+
+# ── Refresh token ────────────────────────────────────────────────
+
+describe "apiary_refresh_agent_token"
+
+mock_reset
+mock_response POST "/api/v1/agents/token/refresh" 200 \
+    '{"data":{"agent":{"id":"agent-1"},"token":"tok-refreshed","refresh_token":"rt-refreshed"},"meta":{},"errors":null}'
+
+APIARY_TOKEN=""
+APIARY_AGENT_REFRESH_TOKEN=""
+result=$(apiary_refresh_agent_token -i "agent-1" -r "rt-old")
+assert_eq "$(echo "$result" | jq -r '.token')" "tok-refreshed" "refresh returns access token"
+
+APIARY_TOKEN=""
+APIARY_AGENT_REFRESH_TOKEN=""
+apiary_refresh_agent_token -i "agent-1" -r "rt-old" >/dev/null
+assert_eq "$APIARY_TOKEN" "tok-refreshed" "refresh stores access token"
+assert_eq "$APIARY_AGENT_REFRESH_TOKEN" "rt-refreshed" "refresh stores rotated refresh token"
+
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.agent_id')" "agent-1" "refresh sends agent_id"
+assert_eq "$(echo "$body" | jq -r '.refresh_token')" "rt-old" "refresh sends refresh token"
+
+# ── Rotate key ───────────────────────────────────────────────────
+
+describe "apiary_rotate_key"
+
+mock_reset
+mock_response POST "/api/v1/agents/key/rotate" 200 \
+    '{"data":{"token":"tok-rotated","refresh_token":"rt-rotated","grace_period_minutes":15},"meta":{},"errors":null}'
+
+APIARY_TOKEN="tok-old"
+APIARY_AGENT_REFRESH_TOKEN="rt-old"
+result=$(apiary_rotate_key -s "new-secret-12345678" -g 15)
+assert_eq "$(echo "$result" | jq -r '.token')" "tok-rotated" "rotate returns token"
+assert_eq "$(echo "$result" | jq -r '.refresh_token')" "rt-rotated" "rotate returns refresh token"
+
+APIARY_TOKEN="tok-old"
+APIARY_AGENT_REFRESH_TOKEN="rt-old"
+apiary_rotate_key -s "new-secret-12345678" -g 15 >/dev/null
+assert_eq "$APIARY_TOKEN" "tok-rotated" "rotate stores new token"
+assert_eq "$APIARY_AGENT_REFRESH_TOKEN" "rt-rotated" "rotate stores new refresh token"
+
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.new_secret')" "new-secret-12345678" "rotate sends new secret"
+assert_eq "$(echo "$body" | jq -r '.grace_period_minutes')" "15" "rotate sends grace period minutes"
 
 # ── Me ───────────────────────────────────────────────────────────
 
