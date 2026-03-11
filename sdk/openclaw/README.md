@@ -45,7 +45,9 @@ Add the following to your `~/.openclaw/openclaw.json`:
           "APIARY_BASE_URL": "https://apiary.example.com",
           "APIARY_HIVE_ID": "01HXYZ...",
           "APIARY_AGENT_NAME": "my-openclaw-agent",
-          "APIARY_AGENT_SECRET": "your-secure-secret-here",
+          "APIARY_AGENT_ID": "01HAGENT...",
+          "APIARY_AGENT_REFRESH_TOKEN": "refresh-token-from-connect-dialog",
+          "APIARY_AGENT_SECRET": "",
           "APIARY_CAPABILITIES": "code,summarize,research"
         }
       }
@@ -62,9 +64,10 @@ See `config/openclaw.example.json` for all available options.
 |---|---|---|---|
 | `APIARY_BASE_URL` | Yes | — | Apiary API base URL |
 | `APIARY_HIVE_ID` | Yes | — | Target hive ID |
-| `APIARY_AGENT_NAME` | Yes* | — | Agent name (*required for first registration) |
-| `APIARY_AGENT_SECRET` | Yes | — | Authentication secret (16+ chars) |
-| `APIARY_AGENT_ID` | No | — | Agent ID (auto-populated after registration) |
+| `APIARY_AGENT_NAME` | For registration | — | Agent name for first-time registration |
+| `APIARY_AGENT_ID` | For refresh/login | — | Agent ID (auto-populated after registration/UI connect) |
+| `APIARY_AGENT_REFRESH_TOKEN` | Recommended | — | Refresh token from Connect Agent dialog (secret-less renewal path) |
+| `APIARY_AGENT_SECRET` | Optional fallback | — | Legacy/shared secret for register/login fallback |
 | `APIARY_CAPABILITIES` | No | `general` | Comma-separated capabilities |
 | `APIARY_POLL_INTERVAL` | No | `10` | Daemon poll interval (seconds) |
 | `APIARY_HEARTBEAT_INTERVAL` | No | `30` | Heartbeat interval (seconds) |
@@ -80,6 +83,11 @@ See `config/openclaw.example.json` for all available options.
 | `APIARY_WAKE_ALERT_ENABLED` | No | `false` | Enable visible Telegram alerts on PR comments |
 | `APIARY_WAKE_ALERT_TELEGRAM` | If alert enabled | — | Telegram chat ID or username target |
 | `APIARY_WAKE_ALERT_CHANNEL` | No | `telegram` | Channel name for alert routing |
+
+Auth state files:
+- `~/.config/apiary/token` — current access token
+- `~/.config/apiary/refresh-token` — current refresh token
+- `~/.config/apiary/agent.json` — agent metadata (`id`, `name`, `hive_id`)
 
 ## Usage
 
@@ -105,13 +113,14 @@ openclaw agent --message "/apiary daemon start"
 ### Direct CLI (without OpenClaw)
 
 ```bash
-# Set required env vars
+# Set env vars from Connect Agent dialog
 export APIARY_BASE_URL="http://localhost:8080"
 export APIARY_HIVE_ID="01HXYZ..."
-export APIARY_AGENT_SECRET="your-secret"
-export APIARY_AGENT_NAME="test-agent"
+export APIARY_AGENT_ID="01HAGENT..."
+export APIARY_TOKEN="bootstrap-access-token"
+export APIARY_AGENT_REFRESH_TOKEN="bootstrap-refresh-token"
 
-# Authenticate
+# Authenticate (validates token, auto-refreshes when needed)
 sdk/openclaw/bin/apiary-cli.sh auth
 
 # Check status
@@ -159,7 +168,7 @@ OpenClaw
 
 All scripts source the existing Apiary Shell SDK (`sdk/shell/src/apiary-sdk.sh`) for HTTP client logic, JSON building, error handling, and API operations. The OpenClaw skill adds:
 
-- **Auto-auth flow**: register → login → token persistence
+- **Auto-auth flow**: token validate → refresh-token renewal → login/register fallback → token persistence
 - **LLM-friendly output**: human-readable formatting for task lists, knowledge entries
 - **Background daemon**: poll loop with heartbeat and exponential backoff
 - **Event operations**: subscribe, unsubscribe, poll, publish (not yet in base Shell SDK)

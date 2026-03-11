@@ -89,7 +89,7 @@ export APIARY_BASE_URL="http://localhost:8080"
 
 | Area | Functions / CLI commands |
 |------|-------------------------|
-| **Auth** | `apiary_register`, `apiary_login`, `apiary_logout`, `apiary_me` |
+| **Auth** | `apiary_register`, `apiary_login`, `apiary_refresh_agent_token`, `apiary_logout`, `apiary_me` |
 | **Lifecycle** | `apiary_heartbeat`, `apiary_update_status` |
 | **Tasks** | `apiary_create_task`, `apiary_poll_tasks`, `apiary_claim_task`, `apiary_update_progress`, `apiary_complete_task`, `apiary_fail_task` |
 | **Task Replay** | `apiary_get_task_trace`, `apiary_replay_task`, `apiary_compare_tasks` |
@@ -127,7 +127,8 @@ php artisan apiary:grant-permission <agent-id> knowledge.write
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `APIARY_BASE_URL` | API base URL (required, no trailing slash) | — |
-| `APIARY_TOKEN` | Bearer token (set automatically by register/login) | — |
+| `APIARY_TOKEN` | Bearer token (set automatically by auth helpers) | — |
+| `APIARY_AGENT_REFRESH_TOKEN` | Agent refresh token (set by register/login/refresh) | — |
 | `APIARY_TIMEOUT` | Request timeout in seconds | `30` |
 | `APIARY_DEBUG` | Set to `1` for verbose curl output on stderr | `0` |
 

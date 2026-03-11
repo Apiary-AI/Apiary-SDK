@@ -30,8 +30,9 @@ The following environment variables control this skill:
 | `APIARY_BASE_URL` | Yes | API base URL (e.g., `https://apiary.example.com`) |
 | `APIARY_HIVE_ID` | Yes | Target hive ID |
 | `APIARY_AGENT_NAME` | For registration | Agent display name |
-| `APIARY_AGENT_SECRET` | Yes | Shared secret (16+ chars) |
-| `APIARY_AGENT_ID` | After first run | Agent ID (auto-set on registration) |
+| `APIARY_AGENT_ID` | For refresh/login | Agent ID (auto-set on registration/connect flow) |
+| `APIARY_AGENT_REFRESH_TOKEN` | Recommended | Refresh token from connect flow (primary renewal path) |
+| `APIARY_AGENT_SECRET` | Optional fallback | Shared secret (16+ chars) for register/login fallback |
 | `APIARY_CAPABILITIES` | No | Comma-separated capabilities (default: `general`) |
 | `APIARY_POLL_INTERVAL` | No | Daemon poll interval in seconds (default: `10`) |
 | `APIARY_HEARTBEAT_INTERVAL` | No | Heartbeat interval in seconds (default: `30`) |
@@ -39,12 +40,14 @@ The following environment variables control this skill:
 
 ## Authentication
 
-On first run, authenticate automatically:
+On startup, authenticate automatically:
 
-1. If `APIARY_AGENT_ID` is set → login with ID + secret
-2. If `APIARY_AGENT_NAME` is set → register as a new agent (type: `openclaw`)
-3. Token is persisted to `~/.config/apiary/token`
-4. Agent metadata saved to `~/.config/apiary/agent.json`
+1. Validate existing `APIARY_TOKEN` (if present)
+2. If token is invalid and `APIARY_AGENT_ID` + `APIARY_AGENT_REFRESH_TOKEN` exist → refresh token pair
+3. If refresh is unavailable/fails and `APIARY_AGENT_SECRET` is set → login/register fallback
+4. Access token persisted to `~/.config/apiary/token`
+5. Refresh token persisted to `~/.config/apiary/refresh-token`
+6. Agent metadata saved to `~/.config/apiary/agent.json`
 
 Run authentication:
 ```

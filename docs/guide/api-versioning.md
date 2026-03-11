@@ -67,6 +67,7 @@ Every API route follows the pattern `api.v1.{resource}.{action}`:
 |------|--------|-----|
 | `api.v1.agents.register` | POST | `/api/v1/agents/register` |
 | `api.v1.agents.login` | POST | `/api/v1/agents/login` |
+| `api.v1.agents.token.refresh` | POST | `/api/v1/agents/token/refresh` |
 | `api.v1.agents.logout` | POST | `/api/v1/agents/logout` |
 | `api.v1.agents.me` | GET | `/api/v1/agents/me` |
 | `api.v1.agents.heartbeat` | POST | `/api/v1/agents/heartbeat` |
@@ -102,7 +103,7 @@ Routes are grouped by authentication requirement:
 
 | Level | Middleware | Endpoints |
 |-------|-----------|-----------|
-| Public | *(none)* | `api.v1.index`, `agents.register`, `agents.login` |
+| Public | *(none)* | `api.v1.index`, `agents.register`, `agents.login`, `agents.token.refresh` |
 | Authenticated | `auth:sanctum-agent` | `agents.logout`, `agents.me`, `agents.heartbeat`, `agents.updateStatus` |
 | Permission-protected | `auth:sanctum-agent` + `permission:{perm}` | All task and knowledge endpoints |
 
@@ -123,6 +124,7 @@ routes/api.php
     ├── prefix('agents')
     │   ├── POST /register             → AgentAuthController@register (public)
     │   ├── POST /login                → AgentAuthController@login (public)
+    │   ├── POST /token/refresh        → AgentAuthController@refreshToken (public, throttled)
     │   └── middleware('auth:sanctum-agent')
     │       ├── POST /logout           → AgentAuthController@logout
     │       ├── GET /me                → AgentAuthController@me
@@ -147,7 +149,7 @@ php artisan test --filter=ApiRouteVersioningTest
 
 Test coverage includes:
 
-- Route registration (all 19 endpoints exist with correct method + URI)
+- Route registration (all expected endpoints exist with correct method + URI)
 - Route naming (all endpoints follow `api.v1.*` convention, no unnamed routes)
 - Version discovery (200 response, correct payload, self-exclusion, required fields)
 - Access behavior (public endpoints skip auth, authenticated endpoints reject without token)
