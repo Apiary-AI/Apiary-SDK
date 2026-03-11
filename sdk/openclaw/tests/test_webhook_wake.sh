@@ -156,6 +156,17 @@ _make_pr_comment_task_flat() {
         }'
 }
 
+_make_pr_comment_task_with_invoke() {
+    local task_id="${1:-task-invoke-001}"
+    local comment_id="${2:-142}"
+
+    _make_pr_comment_task "$task_id" "$comment_id" "octocat/hello-world" "7" "Please fix" | \
+        jq '.payload.invoke = {
+            instructions: "Apply fix and report back",
+            context: {"source":"router","attempt":1}
+        }'
+}
+
 # Build a PR review comment payload (pull_request_review_comment event)
 # Real shape: event_payload.body contains the raw GitHub JSON
 _make_pr_review_comment_task() {
@@ -215,6 +226,19 @@ assert_eq "$(echo "$parsed" | jq -r '.repo')" "octocat/hello" "extracts repo"
 assert_eq "$(echo "$parsed" | jq -r '.pr_number')" "7" "extracts pr_number"
 assert_contains "$(echo "$parsed" | jq -r '.comment_url')" "issuecomment-42" "extracts comment URL"
 assert_eq "$(echo "$parsed" | jq -r '.severity')" "normal" "default severity is normal"
+
+# ── Parser: invoke passthrough fields ──────────────────────────
+
+describe "Parser — invoke passthrough fields"
+
+_setup
+task_json=$(_make_pr_comment_task_with_invoke "t-invoke" 142)
+parsed=$(_wake_parse_pr_comment "$task_json" 2>/dev/null)
+
+assert_eq "$(echo "$parsed" | jq -r '.invoke.instructions // empty')" "Apply fix and report back" \
+    "parser extracts invoke.instructions"
+assert_eq "$(echo "$parsed" | jq -r '.invoke.context.source // empty')" "router" \
+    "parser extracts invoke.context"
 
 # ── Parser: PR review comment ──────────────────────────────────
 
@@ -471,6 +495,22 @@ assert_eq "$_WAKE_LAST_SESSION" "test-session-123" "targets correct session"
 assert_contains "$_WAKE_LAST_MESSAGE" "wake-t1" "message includes task ID"
 assert_contains "$_WAKE_LAST_MESSAGE" "org/repo" "message includes repo"
 assert_contains "$_WAKE_LAST_MESSAGE" "#3" "message includes PR number"
+
+# ── Wake: invoke passthrough included in wake message ──────────
+
+describe "Wake — includes invoke instructions/context in message"
+
+_setup
+_WAKE_INVOCATIONS=0
+task_json=$(_make_pr_comment_task_with_invoke "wake-invoke" 143)
+
+apiary_webhook_wake "$task_json" "wake-invoke"
+
+assert_eq "$_WAKE_INVOCATIONS" "1" "invoke wake: sends one wake"
+assert_contains "$_WAKE_LAST_MESSAGE" "Invoke instructions: Apply fix and report back" \
+    "invoke wake: message includes invoke instructions"
+assert_contains "$_WAKE_LAST_MESSAGE" "Invoke context: {\"source\":\"router\",\"attempt\":1}" \
+    "invoke wake: message includes invoke context"
 
 # ── Wake: disabled does not invoke ─────────────────────────────
 

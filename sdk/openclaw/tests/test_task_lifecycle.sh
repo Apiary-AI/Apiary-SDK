@@ -54,6 +54,8 @@ _setup() {
 
     export PENDING_DIR="${_tmp_dir}/pending"
     mkdir -p "$PENDING_DIR"
+    rm -f "${PENDING_DIR}"/*.json 2>/dev/null || true
+    rm -rf "${PENDING_DIR}/quarantine" 2>/dev/null || true
 
     rm -f "${_tmp_dir}/wake_seen.json"
     rm -f "${_tmp_dir}/wake.log"
@@ -570,10 +572,10 @@ assert_eq "$([ -f "${PENDING_DIR}/retry-stuck.json" ] && echo exists || echo rem
 
 
 # ═══════════════════════════════════════════════════════════════
-# Retry sweep — skips non-webhook_handler tasks
+# Retry sweep — unknown task gets explicit capability_missing failure
 # ═══════════════════════════════════════════════════════════════
 
-describe "Retry sweep — skips non-webhook_handler pending tasks"
+describe "Retry sweep — unknown task type fails with capability_missing"
 
 _setup
 _CLAIM_RC=0
@@ -584,9 +586,45 @@ echo "$other_task" > "${PENDING_DIR}/other-type-1.json"
 
 _lifecycle_retry_pending_handlers
 
-assert_eq "$_CLAIM_CALLS" "0" "retry sweep: claim NOT called for non-webhook type"
-assert_eq "$([ -f "${PENDING_DIR}/other-type-1.json" ] && echo exists || echo removed)" "exists" \
-    "retry sweep: non-webhook pending file untouched"
+assert_eq "$_CLAIM_CALLS" "1" "retry sweep: claim called for unknown type"
+assert_eq "$_COMPLETE_CALLS" "0" "retry sweep: complete not called for unknown type"
+assert_eq "$_FAIL_CALLS" "1" "retry sweep: fail called for unknown type"
+trace_unknown=$(cat "${_tmp_dir}/traces/other-type-1.json" 2>/dev/null || echo "")
+assert_contains "$trace_unknown" "capability_missing" "retry sweep: trace includes capability_missing code"
+assert_contains "$trace_unknown" "code_review" "retry sweep: trace includes missing task type"
+assert_eq "$([ -f "${PENDING_DIR}/other-type-1.json" ] && echo exists || echo removed)" "removed" \
+    "retry sweep: unknown-type pending file removed after fail"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Retry sweep — unknown task includes invoke passthrough fields
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry sweep — unknown task preserves trusted invoke fields"
+
+_setup
+_CLAIM_RC=0
+
+other_task=$(jq -n '{
+    "id":"other-type-2",
+    "type":"triage",
+    "payload":{
+        "invoke":{
+            "instructions":"Handle this manually",
+            "context":{"ticket":"ABC-123","priority":"high"}
+        }
+    }
+}')
+echo "$other_task" > "${PENDING_DIR}/other-type-2.json"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$_FAIL_CALLS" "1" "retry sweep invoke: fail called"
+trace_invoke=$(cat "${_tmp_dir}/traces/other-type-2.json" 2>/dev/null || echo "{}")
+assert_eq "$(echo "$trace_invoke" | jq -r '.trusted_control_plane.invoke.instructions // empty')" "Handle this manually" \
+    "retry sweep invoke: instructions passed through"
+assert_eq "$(echo "$trace_invoke" | jq -r '.trusted_control_plane.invoke.context.ticket // empty')" "ABC-123" \
+    "retry sweep invoke: context passed through"
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -50,6 +50,123 @@ _lifecycle_write_trace() {
     echo "$payload" > "${_LIFECYCLE_TRACE_DIR}/${task_id}.json" 2>/dev/null || true
 }
 
+# Extract trusted control-plane invoke fields from a task payload.
+# Sources (in order):
+#   .payload.invoke.instructions/context
+#   .invoke.instructions/context
+#
+# Outputs compact JSON object:
+#   {"instructions":"...","context":<json|null>}
+_lifecycle_extract_invoke() {
+    local task_json="$1"
+    echo "$task_json" | jq -c '
+        {
+          instructions: (
+            .payload.invoke.instructions
+            // .invoke.instructions
+            // ""
+          ),
+          context: (
+            .payload.invoke.context
+            // .invoke.context
+            // null
+          )
+        }
+    ' 2>/dev/null
+}
+
+# Process unknown routed task types with an explicit structured failure.
+# This guarantees we do not silently drop routed tasks just because the local
+# daemon lacks a concrete handler for the task type.
+_lifecycle_process_missing_capability() {
+    local task_json="${1:-}"
+    local task_id="${2:-}"
+    local task_type="${3:-unknown}"
+    local hive_id="${APIARY_HIVE_ID:-}"
+    local pending_dir="${PENDING_DIR:-${_LIFECYCLE_CONFIG_DIR}/pending}"
+
+    if [[ -z "$task_id" ]]; then
+        _wake_log "WARN" "lifecycle: missing-capability empty task_id; skipping"
+        return 0
+    fi
+
+    if [[ -z "$hive_id" ]]; then
+        _wake_log "WARN" "lifecycle: missing-capability APIARY_HIVE_ID not set; skipping task ${task_id}"
+        return 0
+    fi
+
+    local claim_rc=0
+    apiary_claim_task "$hive_id" "$task_id" >/dev/null 2>&1 || claim_rc=$?
+    if [[ $claim_rc -ne 0 ]]; then
+        if [[ $claim_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            rm -f "${pending_dir}/${task_id}.json"
+            return 0
+        fi
+        _wake_log "WARN" "lifecycle: missing-capability failed to claim task ${task_id} (rc=${claim_rc}); will retry"
+        return 1
+    fi
+
+    local invoke_json
+    invoke_json=$(_lifecycle_extract_invoke "$task_json") || invoke_json='{"instructions":"","context":null}'
+
+    local now_ts
+    now_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')
+
+    local err_json
+    err_json=$(echo "$invoke_json" | jq -c \
+        --arg id "$task_id" \
+        --arg t "$task_type" \
+        --arg ts "$now_ts" '
+            {
+              task_id: $id,
+              status: "failed",
+              code: "capability_missing",
+              error: ("no local handler for routed task type: " + $t),
+              task_type: $t,
+              processed_by: "daemon",
+              trusted_control_plane: {
+                invoke: {
+                  instructions: (.instructions // ""),
+                  context: (.context // null)
+                }
+              },
+              failed_at: $ts
+            }
+        ' 2>/dev/null) || \
+        err_json="{\"task_id\":\"${task_id}\",\"status\":\"failed\",\"code\":\"capability_missing\"}"
+
+    if apiary_fail_task "$hive_id" "$task_id" -e "$err_json" >/dev/null 2>&1; then
+        _lifecycle_write_trace "$task_id" "$err_json"
+        rm -f "${pending_dir}/${task_id}.json"
+        rm -f "${pending_dir}/${task_id}.result.json"
+        rm -f "${pending_dir}/${task_id}.claimed"
+        _wake_log "INFO" "lifecycle: missing-capability failed task ${task_id} (type=${task_type})"
+        return 0
+    fi
+
+    _wake_log "WARN" "lifecycle: missing-capability fail API call failed for task ${task_id}; preserving for retry"
+    return 1
+}
+
+# Route every task through a lifecycle path.
+_lifecycle_process_routed_task() {
+    local task_json="${1:-}"
+    local task_id="${2:-}"
+    local task_type="${3:-}"
+
+    case "$task_type" in
+        webhook_handler)
+            _lifecycle_process_webhook_handler "$task_json" "$task_id"
+            ;;
+        reminder)
+            _lifecycle_process_reminder "$task_json" "$task_id"
+            ;;
+        *)
+            _lifecycle_process_missing_capability "$task_json" "$task_id" "$task_type"
+            ;;
+    esac
+}
+
 # ── Webhook handler lifecycle ─────────────────────────────────
 
 # Process a webhook_handler task through the full lifecycle.
@@ -194,17 +311,25 @@ _lifecycle_process_webhook_handler() {
             process_summary="deduplicated: already processed within debounce window"
         else
             # Build wake message (mirrors apiary_webhook_wake logic)
-            local repo pr_number comment_url severity comment_body
+            local repo pr_number comment_url severity comment_body invoke_instructions invoke_context
             repo=$(echo "$parsed" | jq -r '.repo // "unknown"' 2>/dev/null) || repo="unknown"
             pr_number=$(echo "$parsed" | jq -r '.pr_number // ""' 2>/dev/null) || pr_number=""
             comment_url=$(echo "$parsed" | jq -r '.comment_url // ""' 2>/dev/null) || comment_url=""
             severity=$(echo "$parsed" | jq -r '.severity // "normal"' 2>/dev/null) || severity="normal"
             comment_body=$(echo "$parsed" | jq -r '.comment_body // ""' 2>/dev/null) || comment_body=""
+            invoke_instructions=$(echo "$parsed" | jq -r '.invoke.instructions // ""' 2>/dev/null) || invoke_instructions=""
+            invoke_context=$(echo "$parsed" | jq -c '.invoke.context // null' 2>/dev/null) || invoke_context="null"
             [[ ${#comment_body} -gt 500 ]] && comment_body="${comment_body:0:497}..."
 
             local message
             message=$(printf 'Webhook task %s: PR comment on %s #%s [%s]\nComment: %s\nURL: %s' \
                 "$task_id" "$repo" "$pr_number" "$severity" "$comment_body" "$comment_url")
+            if [[ -n "$invoke_instructions" ]]; then
+                message+=$(printf '\nInvoke instructions: %s' "$invoke_instructions")
+            fi
+            if [[ "$invoke_context" != "null" ]]; then
+                message+=$(printf '\nInvoke context: %s' "$invoke_context")
+            fi
 
             # Deliver: wake + optional alert
             local wake_ok=0 alert_ok=0
@@ -511,25 +636,20 @@ _lifecycle_retry_pending_handlers() {
     local pending_file
     for pending_file in "${pending_dir}"/*.json; do
         [[ -f "$pending_file" ]] || continue
+        [[ "$pending_file" == *.result.json ]] && continue
 
         local ptask_json ptask_id ptask_type
         ptask_json=$(cat "$pending_file" 2>/dev/null) || continue
         ptask_id=$(basename "$pending_file" .json)
-        ptask_type=$(echo "$ptask_json" | jq -r '.type' 2>/dev/null) || continue
+        ptask_type=$(echo "$ptask_json" | jq -r '.type // empty' 2>/dev/null) || ptask_type=""
+        [[ -z "$ptask_type" ]] && continue
 
-        case "$ptask_type" in
-            webhook_handler)
-                _lifecycle_process_webhook_handler "$ptask_json" "$ptask_id" || true
-                # Count successful wake/alert deliveries from retry path
-                if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
-                    _stats_wakes_sent=$(( ${_stats_wakes_sent:-0} + 1 ))
-                fi
-                ;;
-            reminder)
-                _lifecycle_process_reminder "$ptask_json" "$ptask_id" || true
-                ;;
-            *)
-                ;;
-        esac
+        _lifecycle_process_routed_task "$ptask_json" "$ptask_id" "$ptask_type" || true
+
+        # Count successful wake/alert deliveries from retry path.
+        # Only webhook_handler sets this sentinel.
+        if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
+            _stats_wakes_sent=$(( ${_stats_wakes_sent:-0} + 1 ))
+        fi
     done
 }

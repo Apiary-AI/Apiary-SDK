@@ -185,7 +185,7 @@ assert_eq "$_FAIL_CALLS" "1" "fail called when delivery fails"
 assert_contains "$_FAIL_LAST_ERROR" "delivery failed" "fail payload includes delivery error"
 
 
-describe "Retry sweep — processes reminder tasks and skips unrelated types"
+describe "Retry sweep — processes reminder and explicitly fails unsupported types"
 
 _setup
 reminder_task=$(_make_reminder_task "rem-retry" "telegram" "999" "Retry reminder")
@@ -196,11 +196,11 @@ echo "$other_task" > "${PENDING_DIR}/other-1.json"
 
 _lifecycle_retry_pending_handlers
 
-assert_eq "$_CLAIM_CALLS" "1" "retry sweep claims reminder task"
+assert_eq "$_CLAIM_CALLS" "2" "retry sweep claims reminder and unsupported task"
 assert_eq "$_COMPLETE_CALLS" "1" "retry sweep completes reminder task"
-assert_eq "$_FAIL_CALLS" "0" "retry sweep does not fail successful reminder"
+assert_eq "$_FAIL_CALLS" "1" "retry sweep fails unsupported task with explicit response"
 assert_eq "$([ -f "${PENDING_DIR}/rem-retry.json" ] && echo exists || echo removed)" "removed" "retry sweep removes reminder pending file"
-assert_eq "$([ -f "${PENDING_DIR}/other-1.json" ] && echo exists || echo removed)" "exists" "retry sweep leaves unrelated task untouched"
+assert_eq "$([ -f "${PENDING_DIR}/other-1.json" ] && echo exists || echo removed)" "removed" "retry sweep removes unsupported pending file after fail"
 
 
 test_summary
