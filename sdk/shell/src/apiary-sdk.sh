@@ -465,14 +465,15 @@ apiary_get_pool_health() {
 #   HIVE_ID  -t TYPE  [-p PRIORITY] [-a TARGET_AGENT_ID] [-c TARGET_CAPABILITY]
 #   [-d PAYLOAD_JSON] [-T TIMEOUT_SECONDS] [-r MAX_RETRIES] [-P PARENT_TASK_ID]
 #   [-x CONTEXT_REFS_JSON] [-g GUARANTEE] [-e EXPIRES_AT]
+#   [-I INVOKE_INSTRUCTIONS] [-X INVOKE_CONTEXT_JSON]
 apiary_create_task() {
     local hive_id="${1:?usage: apiary_create_task HIVE_ID -t TYPE ...}"
     shift
     local task_type="" priority="" target_agent_id="" target_capability=""
     local payload="" timeout_seconds="" max_retries="" parent_task_id="" context_refs=""
-    local guarantee="" expires_at=""
+    local guarantee="" expires_at="" invoke_instructions="" invoke_context=""
     local OPTIND OPTARG opt
-    while getopts "t:p:a:c:d:T:r:P:x:g:e:" opt; do
+    while getopts "t:p:a:c:d:T:r:P:x:g:e:I:X:" opt; do
         case "$opt" in
             t) task_type="$OPTARG" ;;
             p) priority="$OPTARG" ;;
@@ -485,6 +486,8 @@ apiary_create_task() {
             x) context_refs="$OPTARG" ;;
             g) guarantee="$OPTARG" ;;
             e) expires_at="$OPTARG" ;;
+            I) invoke_instructions="$OPTARG" ;;
+            X) invoke_context="$OPTARG" ;;
             *) _apiary_err "create_task: unknown option -$opt"; return $APIARY_ERR ;;
         esac
     done
@@ -492,6 +495,14 @@ apiary_create_task() {
     if [[ -z "$task_type" ]]; then
         _apiary_err "create_task: -t TYPE is required"
         return $APIARY_ERR
+    fi
+
+    local invoke_json=""
+    if [[ -n "$invoke_instructions" || -n "$invoke_context" ]]; then
+        invoke_json=$(_apiary_build_json \
+            "instructions" "$invoke_instructions" \
+            "context" "$invoke_context"
+        ) || return $APIARY_ERR
     fi
 
     local body
@@ -506,7 +517,8 @@ apiary_create_task() {
         "parent_task_id" "$parent_task_id" \
         "context_refs" "$context_refs" \
         "guarantee" "$guarantee" \
-        "expires_at" "$expires_at"
+        "expires_at" "$expires_at" \
+        "invoke" "$invoke_json"
     ) || return $APIARY_ERR
 
     _apiary_request POST "/api/v1/hives/${hive_id}/tasks" "$body"

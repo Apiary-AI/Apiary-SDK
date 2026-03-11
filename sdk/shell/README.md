@@ -29,6 +29,11 @@ apiary_register -n "my-agent" -h "$HIVE_ID" -s "my-secure-secret-16+"
 # Create a task (requires tasks.create permission)
 apiary_create_task "$HIVE_ID" -t "summarize" -d '{"text": "..."}'
 
+# First-class invoke control-plane fields (still compatible with payload.invoke passthrough)
+apiary_create_task "$HIVE_ID" -t "review.pr" \
+  -I "Fix failing checks and report back" \
+  -X '{"repo":"Apiary-AI/Apiary-SDK","pr":123}'
+
 # Poll & claim (requires tasks.claim + tasks.update permissions)
 tasks=$(apiary_poll_tasks "$HIVE_ID" -c "code")
 if [[ $(echo "$tasks" | jq 'length') -gt 0 ]]; then
@@ -73,6 +78,11 @@ export APIARY_BASE_URL="http://localhost:8080"
 
 # Create a task
 ./sdk/shell/bin/apiary-cli task-create "$HIVE_ID" -t "summarize" -d '{"text":"hello"}'
+
+# Create a task with first-class invoke instructions/context
+./sdk/shell/bin/apiary-cli task-create "$HIVE_ID" -t "review.pr" \
+  -I "Fix failing checks and report back" \
+  -X '{"repo":"Apiary-AI/Apiary-SDK","pr":123}'
 ```
 
 ## API coverage

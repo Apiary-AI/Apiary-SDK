@@ -251,6 +251,8 @@ class ApiaryClient:
         context_refs: list[str] | None = None,
         guarantee: str | None = None,
         expires_at: str | None = None,
+        invoke_instructions: str | None = None,
+        invoke_context: Any | None = None,
         failure_policy: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -276,6 +278,12 @@ class ApiaryClient:
             body["guarantee"] = guarantee
         if expires_at is not None:
             body["expires_at"] = expires_at
+        if invoke_instructions is not None or invoke_context is not None:
+            body["invoke"] = {}
+            if invoke_instructions is not None:
+                body["invoke"]["instructions"] = invoke_instructions
+            if invoke_context is not None:
+                body["invoke"]["context"] = invoke_context
         if failure_policy is not None:
             body["failure_policy"] = failure_policy
         if idempotency_key is not None:

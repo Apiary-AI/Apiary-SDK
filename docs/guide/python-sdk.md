@@ -65,6 +65,8 @@ with ApiaryClient("http://localhost:8080") as client:
         "01HXYZ...",
         task_type="summarize",
         payload={"text": "Hello world"},
+        invoke_instructions="Fix failing checks and report back",
+        invoke_context={"repo": "Apiary-AI/Apiary-SDK", "pr": 123},
     )
     print(f"Task {task['id']} created")
 ```
@@ -123,12 +125,18 @@ task = client.create_task(
     hive_id,
     task_type="process",
     priority=3,                         # 0 (highest) to 4 (lowest)
-    target_capability="code",           # optional: route to capable agents
+    target_capability="code",          # optional: route to capable agents
     payload={"input": "data"},
+    invoke_instructions="Fix failing checks and report back",
+    invoke_context={"repo": "Apiary-AI/Apiary-SDK", "pr": 123},
     timeout_seconds=300,
     max_retries=5,
 )
 ```
+
+`invoke_instructions` / `invoke_context` map to top-level
+`invoke.instructions` / `invoke.context` and remain compatible with legacy
+`payload["invoke"]` passthrough.
 
 ### Poll, claim, and complete
 

@@ -112,13 +112,19 @@ task=$(apiary_create_task "$HIVE_ID" \
     -p 3 \
     -c "code" \
     -d '{"input": "data"}' \
+    -I "Fix failing checks and report back" \
+    -X '{"repo":"Apiary-AI/Apiary-SDK","pr":123}' \
     -T 300 \
     -r 5)
 ```
 
 Options: `-t TYPE` (required), `-p PRIORITY` (0-4), `-a TARGET_AGENT_ID`,
 `-c TARGET_CAPABILITY`, `-d PAYLOAD_JSON`, `-T TIMEOUT_SECONDS`,
-`-r MAX_RETRIES`, `-P PARENT_TASK_ID`, `-x CONTEXT_REFS_JSON`.
+`-r MAX_RETRIES`, `-P PARENT_TASK_ID`, `-x CONTEXT_REFS_JSON`,
+`-I INVOKE_INSTRUCTIONS`, `-X INVOKE_CONTEXT_JSON`.
+
+`-I/-X` map to top-level `invoke.instructions` / `invoke.context` and remain
+compatible with legacy `payload.invoke.*` passthrough.
 
 ### Poll, claim, and complete
 
@@ -281,7 +287,7 @@ Send liveness signal.
 
 Set agent status (online/busy/idle/offline/error).
 
-### `apiary_create_task HIVE_ID -t TYPE [-p PRI] [-a AGENT] [-c CAP] [-d PAYLOAD] [-T TIMEOUT] [-r RETRIES] [-P PARENT] [-x REFS]`
+### `apiary_create_task HIVE_ID -t TYPE [-p PRI] [-a AGENT] [-c CAP] [-d PAYLOAD] [-T TIMEOUT] [-r RETRIES] [-P PARENT] [-x REFS] [-I INSTRUCTIONS] [-X CONTEXT_JSON]`
 
 Create a task.
 
