@@ -146,18 +146,13 @@ OpenClaw
        ├─ HEARTBEAT.md           → periodic health checks
        └─ apiary-daemon.sh       → background polling loop
             ├─ Task poll → detects pending tasks
-            │    └─ webhook_handler → apiary-task-lifecycle.sh (full lifecycle)
-            │         ├─ 1. Claim task atomically (409 = skip, error = retry)
-            │         ├─ 2. Process via apiary-webhook-wake.sh
-            │         │    ├─ Parse PR comment metadata (repo, PR#, severity)
-            │         │    ├─ Deduplicate via wake_seen.json
-            │         │    ├─ A) sessions_send → internal wake (CLI + gateway)
-            │         │    └─ B) message.send → visible alert (if enabled)
-            │         ├─ 3. Complete or fail task in Apiary
-            │         ├─ 4. Write trace to ~/.config/apiary/traces/
-            │         └─ 5. Remove pending file
+            │    └─ apiary-task-lifecycle.sh (full lifecycle dispatch)
+            │         ├─ webhook_handler → wake bridge + complete/fail
+            │         ├─ reminder       → message delivery + complete/fail
+            │         └─ unknown type   → explicit capability_missing fail
+            │              (includes trusted invoke instructions/context)
             ├─ Heartbeat → keeps agent alive
-            └─ Event poll → incoming event handling
+            └─ Event poll → raw event ingestion + OpenClaw system events
 ```
 
 ### Shell SDK Dependency
@@ -170,21 +165,26 @@ All scripts source the existing Apiary Shell SDK (`sdk/shell/src/apiary-sdk.sh`)
 - **Event operations**: subscribe, unsubscribe, poll, publish (not yet in base Shell SDK)
 - **Pending task files**: task data written to disk for LLM consumption
 - **Webhook-wake bridge**: auto-wake OpenClaw sessions on actionable webhook events
-- **Task lifecycle**: automatic claim → process → complete/fail for webhook_handler tasks
+- **Task lifecycle dispatch**: webhook_handler/reminder handlers + explicit capability_missing fail for unknown routed task types
 
-## Webhook Handler Task Lifecycle
+## Routed Task Lifecycle
 
-The daemon manages the full lifecycle for `webhook_handler` tasks so they don't pile up as pending in Apiary. When a webhook_handler task is polled, the daemon automatically:
+The daemon manages the full lifecycle for routed tasks so they don't pile up as pending in Apiary. Every polled task is dispatched through lifecycle handling:
+
+- `webhook_handler` → webhook-wake bridge flow
+- `reminder` → direct message delivery flow
+- any other type → explicit `capability_missing` failure (structured error)
 
 1. **Claims** the task atomically (`PATCH .../tasks/{id}/claim`). If another agent already claimed it (409 Conflict), the daemon skips and cleans up the local pending file. On network error, the pending file is preserved for retry on the next poll cycle.
 
-2. **Processes** via the webhook-wake bridge: parses the event payload, deduplicates, and delivers the wake/alert through configured channels.
+2. **Processes** via the routed handler (webhook wake, reminder delivery, or default capability-missing response).
 
-3. **Completes or fails** the task in Apiary with a structured result payload:
+3. **Completes or fails** the task in Apiary with a structured payload:
    - **Success**: `{"status":"completed","summary":"delivered: wake=1 alert=0",...}`
    - **Filtered**: `{"status":"completed","summary":"filtered: not a PR comment webhook",...}`
    - **Deduplicated**: `{"status":"completed","summary":"deduplicated: already processed",...}`
    - **Failure**: `{"status":"failed","error":"all delivery channels failed",...}`
+   - **Capability missing**: `{"code":"capability_missing","task_type":"...","trusted_control_plane":{"invoke":{...}},...}`
 
 4. **Writes a trace** to `~/.config/apiary/traces/{task_id}.json` for local debugging.
 
@@ -196,6 +196,8 @@ The daemon manages the full lifecycle for `webhook_handler` tasks so they don't 
 - **Claim errors are not silent**: network failures return exit code 1 so the daemon can retry; 409 conflicts are logged and the pending file is cleaned up.
 - **No delivery channels enabled**: if wake and alert are both disabled, the task is still claimed and completed (acknowledged) rather than left pending forever.
 - **Deduplication**: if a task+comment was already processed within the debounce window, the task is completed with a "deduplicated" summary.
+- **Trusted control-plane passthrough**: canonical `invoke.instructions/context` are propagated into wake text and capability-missing failure payloads, with legacy fallback to `payload.invoke.*`.
+- **No implicit drop**: unknown routed task types are explicitly failed, and polled events are surfaced as OpenClaw system events.
 
 ## Webhook-Wake Bridge
 
@@ -269,6 +271,7 @@ Default modes:
 | `~/.config/apiary/agent.json` | Agent ID and metadata |
 | `~/.config/apiary/daemon.pid` | Daemon PID file |
 | `~/.config/apiary/pending/*.json` | Pending task files |
+| `~/.config/apiary/pending/events/*.json` | Polled event snapshots (for local inspection) |
 | `~/.config/apiary/cursor.json` | Last event poll cursor |
 | `~/.config/apiary/wake_seen.json` | Webhook-wake deduplication state |
 | `~/.config/apiary/wake.log` | Webhook-wake activity log |

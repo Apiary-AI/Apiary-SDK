@@ -53,19 +53,37 @@ class TestCreateTask:
                 task_type="process",
                 priority=4,
                 target_capability="code",
-                payload={"input": "data"},
+                payload={
+                    "input": "data",
+                    "invoke": {
+                        "instructions": "legacy payload instructions",
+                        "context": {"origin": "payload"},
+                    },
+                },
                 timeout_seconds=300,
                 max_retries=5,
                 context_refs=["ref-1"],
+                invoke_instructions="first-class instructions",
+                invoke_context={"origin": "top-level", "attempt": 2},
             )
         body = json.loads(httpx_mock.get_request().content)
         assert body["type"] == "process"
         assert body["priority"] == 4
         assert body["target_capability"] == "code"
-        assert body["payload"] == {"input": "data"}
+        assert body["payload"] == {
+            "input": "data",
+            "invoke": {
+                "instructions": "legacy payload instructions",
+                "context": {"origin": "payload"},
+            },
+        }
         assert body["timeout_seconds"] == 300
         assert body["max_retries"] == 5
         assert body["context_refs"] == ["ref-1"]
+        assert body["invoke"] == {
+            "instructions": "first-class instructions",
+            "context": {"origin": "top-level", "attempt": 2},
+        }
 
 
 class TestPollTasks:

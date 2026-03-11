@@ -208,6 +208,12 @@ _wake_parse_pr_comment() {
         fi
     fi
 
+    # Extract trusted control-plane invoke passthrough fields.
+    # Canonical contract is top-level .invoke.* with legacy payload fallback.
+    local invoke_instructions invoke_context
+    invoke_instructions=$(echo "$task_json" | jq -r '.invoke.instructions // .payload.invoke.instructions // empty' 2>/dev/null) || invoke_instructions=""
+    invoke_context=$(echo "$task_json" | jq -c '.invoke.context // .payload.invoke.context // null' 2>/dev/null) || invoke_context="null"
+
     # Build result JSON
     jq -n \
         --arg action "$action" \
@@ -218,6 +224,8 @@ _wake_parse_pr_comment() {
         --arg pr_url "${pr_url:-}" \
         --arg repo "$repo_full_name" \
         --arg severity "$severity" \
+        --arg invoke_instructions "$invoke_instructions" \
+        --argjson invoke_context "$invoke_context" \
         '{
             action: $action,
             comment_id: $comment_id,
@@ -226,7 +234,11 @@ _wake_parse_pr_comment() {
             pr_number: $pr_number,
             pr_url: $pr_url,
             repo: $repo,
-            severity: $severity
+            severity: $severity,
+            invoke: {
+                instructions: $invoke_instructions,
+                context: $invoke_context
+            }
         }' 2>/dev/null || return 1
 }
 
@@ -416,12 +428,14 @@ apiary_webhook_wake() {
     fi
 
     # Build wake message
-    local repo pr_number comment_url severity comment_body
+    local repo pr_number comment_url severity comment_body invoke_instructions invoke_context
     repo=$(echo "$parsed" | jq -r '.repo // "unknown"' 2>/dev/null) || repo="unknown"
     pr_number=$(echo "$parsed" | jq -r '.pr_number // ""' 2>/dev/null) || pr_number=""
     comment_url=$(echo "$parsed" | jq -r '.comment_url // ""' 2>/dev/null) || comment_url=""
     severity=$(echo "$parsed" | jq -r '.severity // "normal"' 2>/dev/null) || severity="normal"
     comment_body=$(echo "$parsed" | jq -r '.comment_body // ""' 2>/dev/null) || comment_body=""
+    invoke_instructions=$(echo "$parsed" | jq -r '.invoke.instructions // ""' 2>/dev/null) || invoke_instructions=""
+    invoke_context=$(echo "$parsed" | jq -c '.invoke.context // null' 2>/dev/null) || invoke_context="null"
 
     # Truncate comment body for the wake message (max 500 chars)
     if [[ ${#comment_body} -gt 500 ]]; then
@@ -431,6 +445,14 @@ apiary_webhook_wake() {
     local message
     message=$(printf 'Webhook task %s: PR comment on %s #%s [%s]\nComment: %s\nURL: %s' \
         "$task_id" "$repo" "$pr_number" "$severity" "$comment_body" "$comment_url")
+
+    # Trusted control-plane passthrough for invoke instructions/context.
+    if [[ -n "$invoke_instructions" ]]; then
+        message+=$(printf '\nInvoke instructions: %s' "$invoke_instructions")
+    fi
+    if [[ "$invoke_context" != "null" ]]; then
+        message+=$(printf '\nInvoke context: %s' "$invoke_context")
+    fi
 
     # Send internal wake (fail-soft)
     local wake_ok=0

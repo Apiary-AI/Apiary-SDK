@@ -32,6 +32,14 @@ with ApiaryClient("http://localhost:8080") as client:
     # Create a task (requires tasks.create permission)
     task = client.create_task("01HXYZ...", task_type="summarize", payload={"text": "..."})
 
+    # Canonical invoke control-plane fields (legacy payload.invoke.* is accepted; top-level wins in mixed mode)
+    task = client.create_task(
+        "01HXYZ...",
+        task_type="review.pr",
+        invoke_instructions="Fix failing checks and report back",
+        invoke_context={"repo": "Apiary-AI/Apiary-SDK", "pr": 123},
+    )
+
     # Poll & claim (requires tasks.claim permission)
     tasks = client.poll_tasks("01HXYZ...", capability="code")
     if tasks:

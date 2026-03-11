@@ -140,6 +140,38 @@ set -e
 assert_eq "$rc" "0" "returns 0 on binary garbage"
 assert_eq "$cursor" "" "cursor is empty on binary garbage"
 
+# ── Test: poll_raw does not advance cursor before handling ──────
+
+describe "poll_raw does not advance cursor"
+
+_setup
+export APIARY_HIVE_ID="hive-test-001"
+# Seed existing cursor
+_apiary_oc_save_cursor "evt-prev"
+
+_apiary_request() {
+    echo '[{"id":"evt-new-1","type":"test"}]'
+    return 0
+}
+
+set +e
+result=$(apiary_oc_events_poll_raw)
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "poll_raw succeeds"
+assert_contains "$result" "evt-new-1" "poll_raw returns fetched events"
+assert_eq "$(_apiary_oc_load_cursor 2>/dev/null)" "evt-prev" "cursor unchanged after poll_raw"
+
+# ── Test: explicit cursor commit persists last handled event ────
+
+describe "commit_cursor persists last handled event id"
+
+_setup
+apiary_oc_events_commit_cursor "evt-committed"
+
+assert_eq "$(_apiary_oc_load_cursor 2>/dev/null)" "evt-committed" "commit_cursor writes cursor"
+
 # ── Summary ──────────────────────────────────────────────────────
 
 test_summary

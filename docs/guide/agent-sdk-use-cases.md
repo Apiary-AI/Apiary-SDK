@@ -17,9 +17,14 @@ Goal: reduce ambiguity, prevent routing mistakes, and keep routing metadata cano
 
 3. **Treat payload as business data**, not control-plane metadata.
 
-4. **Use idempotency keys** for retryable create writes.
+4. **Invoke control-plane contract for task creation**
+   - Canonical: top-level `invoke.instructions` / `invoke.context`
+   - Legacy compatibility: `payload.invoke.instructions` / `payload.invoke.context`
+   - Mixed mode precedence: top-level `invoke.*` wins per field when both are present
 
-5. **Store time in UTC** and include source timezone only for presentation/context.
+5. **Use idempotency keys** for retryable create writes.
+
+6. **Store time in UTC** and include source timezone only for presentation/context.
 
 ---
 
