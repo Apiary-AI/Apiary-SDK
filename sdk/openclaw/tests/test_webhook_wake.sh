@@ -1124,6 +1124,139 @@ task_json=$(_make_pr_comment_task "dual-t6" 605 "org/icon" 25 "[high] Needs atte
 apiary_webhook_wake "$task_json" "dual-t6"
 assert_contains "$_ALERT_LAST_MESSAGE" "high" "icon: high severity in alert"
 
+
+# ═══════════════════════════════════════════════════════════════
+# P2: whitespace .body falls back to event_payload
+# ═══════════════════════════════════════════════════════════════
+
+# Build a task where .body is whitespace but event_payload has valid PR comment data
+_make_whitespace_body_task() {
+    local task_id="${1:-task-ws}"
+    local comment_id="${2:-42}"
+    local repo="${3:-org/ws-repo}"
+    local pr_num="${4:-7}"
+    local comment_body="${5:-Whitespace body test}"
+
+    jq -n \
+        --arg tid "$task_id" \
+        --argjson cid "$comment_id" \
+        --arg repo "$repo" \
+        --argjson pr "$pr_num" \
+        --arg cbody "$comment_body" \
+        --arg curl "https://github.com/${repo}/pull/${pr_num}#issuecomment-${comment_id}" \
+        --arg purl "https://github.com/${repo}/pull/${pr_num}" \
+        '{
+            id: $tid,
+            type: "webhook_handler",
+            payload: {
+                event_payload: {
+                    action: "created",
+                    body: "   ",
+                    comment: {
+                        id: $cid,
+                        html_url: $curl,
+                        body: $cbody
+                    },
+                    issue: {
+                        number: $pr,
+                        pull_request: {
+                            html_url: $purl
+                        }
+                    },
+                    repository: {
+                        full_name: $repo
+                    }
+                }
+            }
+        }'
+}
+
+_make_empty_string_body_task() {
+    local task_id="${1:-task-es}"
+    local comment_id="${2:-42}"
+    local repo="${3:-org/es-repo}"
+    local pr_num="${4:-7}"
+    local comment_body="${5:-Empty string body test}"
+
+    jq -n \
+        --arg tid "$task_id" \
+        --argjson cid "$comment_id" \
+        --arg repo "$repo" \
+        --argjson pr "$pr_num" \
+        --arg cbody "$comment_body" \
+        --arg curl "https://github.com/${repo}/pull/${pr_num}#issuecomment-${comment_id}" \
+        --arg purl "https://github.com/${repo}/pull/${pr_num}" \
+        '{
+            id: $tid,
+            type: "webhook_handler",
+            payload: {
+                event_payload: {
+                    action: "created",
+                    body: "",
+                    comment: {
+                        id: $cid,
+                        html_url: $curl,
+                        body: $cbody
+                    },
+                    issue: {
+                        number: $pr,
+                        pull_request: {
+                            html_url: $purl
+                        }
+                    },
+                    repository: {
+                        full_name: $repo
+                    }
+                }
+            }
+        }'
+}
+
+describe "P2 Parser — whitespace .body falls back to event_payload"
+
+_setup
+task_json=$(_make_whitespace_body_task "p2-ws" 8001 "org/ws-test" 80 "Whitespace body comment")
+
+set +e
+parsed=$(_wake_parse_pr_comment "$task_json" 2>/dev/null)
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "p2-ws: parses successfully (falls back to event_payload)"
+assert_eq "$(echo "$parsed" | jq -r '.comment_id')" "8001" "p2-ws: extracts comment_id"
+assert_eq "$(echo "$parsed" | jq -r '.repo')" "org/ws-test" "p2-ws: extracts repo"
+assert_eq "$(echo "$parsed" | jq -r '.pr_number')" "80" "p2-ws: extracts pr_number"
+assert_eq "$(echo "$parsed" | jq -r '.comment_body')" "Whitespace body comment" "p2-ws: extracts comment body"
+
+
+describe "P2 Parser — empty string .body falls back to event_payload"
+
+_setup
+task_json=$(_make_empty_string_body_task "p2-es" 8002 "org/es-test" 81 "Empty string body")
+
+set +e
+parsed=$(_wake_parse_pr_comment "$task_json" 2>/dev/null)
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "p2-es: parses successfully (falls back to event_payload)"
+assert_eq "$(echo "$parsed" | jq -r '.comment_id')" "8002" "p2-es: extracts comment_id"
+assert_eq "$(echo "$parsed" | jq -r '.repo')" "org/es-test" "p2-es: extracts repo"
+
+
+describe "P2 Wake — whitespace .body still delivers wake correctly"
+
+_setup
+_WAKE_INVOCATIONS=0
+task_json=$(_make_whitespace_body_task "p2-wake" 8003 "org/ws-wake" 82 "Wake with whitespace body")
+
+apiary_webhook_wake "$task_json" "p2-wake"
+
+assert_eq "$_WAKE_INVOCATIONS" "1" "p2-wake: wake sent despite whitespace .body"
+assert_contains "$_WAKE_LAST_MESSAGE" "org/ws-wake" "p2-wake: message includes repo"
+assert_contains "$_WAKE_LAST_MESSAGE" "#82" "p2-wake: message includes PR number"
+
+
 # ═══════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════
