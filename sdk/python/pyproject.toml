@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apiary-sdk"
+version = "0.1.0"
+description = "Python SDK for the Apiary agent orchestration platform"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Apiary AI", email = "dev@apiary.ai" },
+]
+keywords = ["apiary", "agent", "orchestration", "sdk"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-httpx>=0.34",
+    "ruff>=0.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/Apiary-AI/Apiary-SaaS"
+Documentation = "https://github.com/Apiary-AI/Apiary-SaaS/tree/main/sdk/python"
+Repository = "https://github.com/Apiary-AI/Apiary-SaaS"
+Issues = "https://github.com/Apiary-AI/Apiary-SaaS/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["apiary_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

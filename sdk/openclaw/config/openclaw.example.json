@@ -1,0 +1,30 @@
+{
+  "skills": {
+    "entries": {
+      "apiary": {
+        "enabled": true,
+        "env": {
+          "APIARY_BASE_URL": "https://apiary.example.com",
+          "APIARY_HIVE_ID": "01HXYZ...",
+          "APIARY_AGENT_NAME": "my-openclaw-agent",
+          "APIARY_AGENT_SECRET": "change-me-secure-secret-16chars",
+          "APIARY_AGENT_ID": "",
+          "APIARY_CAPABILITIES": "code,summarize,research",
+          "APIARY_POLL_INTERVAL": "10",
+          "APIARY_HEARTBEAT_INTERVAL": "30",
+          "APIARY_AUTO_DAEMON": "true",
+          "APIARY_WAKE_ENABLED": "false",
+          "APIARY_WAKE_SESSION": "",
+          "APIARY_WAKE_LOG": "",
+          "APIARY_WAKE_DEBOUNCE_SECS": "5",
+          "APIARY_WAKE_GATEWAY_URL": "",
+          "APIARY_WAKE_GATEWAY_TOKEN": "",
+          "APIARY_WAKE_GATEWAY_TIMEOUT": "5",
+          "APIARY_WAKE_ALERT_ENABLED": "false",
+          "APIARY_WAKE_ALERT_TELEGRAM": "",
+          "APIARY_WAKE_ALERT_CHANNEL": "telegram"
+        }
+      }
+    }
+  }
+}

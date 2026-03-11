@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# apiary-task-lifecycle.sh — End-to-end task lifecycle for webhook_handler tasks.
+#
+# The daemon polls pending tasks but previously never claimed, processed,
+# or completed them in Apiary.  This module closes the lifecycle:
+#
+#   claim (atomic) → process via webhook wake → complete / fail → trace → cleanup
+#
+# Designed to be sourced by apiary-daemon.sh.  All functions are fail-soft
+# at the daemon level (never crash the main loop), but individual failures
+# are reported back to Apiary so tasks don't pile up as pending forever.
+#
+# Env vars:
+#   APIARY_CONFIG_DIR  — Config directory (default: ~/.config/apiary)
+#   APIARY_HIVE_ID     — Hive ID (required, from auth)
+
+# ── Source Shell SDK (guard against re-sourcing) ────────────────
+if [[ -z "${_APIARY_SDK_LOADED:-}" ]]; then
+    _src="${BASH_SOURCE[0]}"
+    while [[ -L "$_src" ]]; do
+        _dir="$(cd "$(dirname "$_src")" && pwd)"
+        _src="$(readlink "$_src")"
+        [[ "$_src" != /* ]] && _src="$_dir/$_src"
+    done
+    SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+    unset _src _dir
+    # shellcheck source=_resolve-sdk.sh
+    source "${SCRIPT_DIR}/_resolve-sdk.sh"
+    _apiary_find_shell_sdk || return 1
+    # shellcheck source=../../shell/src/apiary-sdk.sh
+    source "$_APIARY_SHELL_SDK_PATH"
+    _APIARY_SDK_LOADED=1
+fi
+
+# ── Configuration ──────────────────────────────────────────────
+
+_LIFECYCLE_CONFIG_DIR="${APIARY_CONFIG_DIR:-${HOME}/.config/apiary}"
+_LIFECYCLE_TRACE_DIR="${_LIFECYCLE_CONFIG_DIR}/traces"
+
+# ── Trace persistence ─────────────────────────────────────────
+
+# Write a trace record for audit/debugging.
+# Stored at ~/.config/apiary/traces/{task_id}.json
+_lifecycle_write_trace() {
+    local task_id="$1"
+    local payload="$2"
+
+    mkdir -p "$_LIFECYCLE_TRACE_DIR" 2>/dev/null || return 0
+    echo "$payload" > "${_LIFECYCLE_TRACE_DIR}/${task_id}.json" 2>/dev/null || true
+}
+
+# ── Webhook handler lifecycle ─────────────────────────────────
+
+# Process a webhook_handler task through the full lifecycle.
+#
+# Steps:
+#   1. Claim task atomically (409 = another agent got it → skip)
+#   2. Process via webhook wake bridge (parse, dedup, deliver)
+#   3. Complete or fail the task in Apiary
+#   4. Write a local trace record
+#   5. Remove from pending directory
+#
+# Arguments:
+#   $1 — task JSON (full task object)
+#   $2 — task ID
+#
+# Returns:
+#   0 — processed (success, filtered, deduped, or conflict-skipped)
+#   1 — transient error (claim network failure → will retry next poll)
+_lifecycle_process_webhook_handler() {
+    local task_json="${1:-}"
+    local task_id="${2:-}"
+    local hive_id="${APIARY_HIVE_ID:-}"
+    local pending_dir="${PENDING_DIR:-${_LIFECYCLE_CONFIG_DIR}/pending}"
+
+    # Signal: set to 1 only when wake/alert delivery actually succeeds.
+    # The daemon reads this after the call to decide whether to increment wakes_sent.
+    _lifecycle_wake_delivered=0
+
+    if [[ -z "$task_id" ]]; then
+        _wake_log "WARN" "lifecycle: empty task_id; skipping"
+        return 0
+    fi
+
+    if [[ -z "$hive_id" ]]; then
+        _wake_log "WARN" "lifecycle: APIARY_HIVE_ID not set; skipping task ${task_id}"
+        return 0
+    fi
+
+    # ── Step 0: Check for saved result artifact ───────────────
+    # If a prior run completed processing but the terminal API call
+    # (complete/fail) failed, we saved the result to a .result.json
+    # file.  Re-entering claim would get 409 and strand the task.
+    # Skip directly to the terminal API call with the saved result.
+    local result_artifact="${pending_dir}/${task_id}.result.json"
+    if [[ -f "$result_artifact" ]]; then
+        _wake_log "INFO" "lifecycle: found result artifact for task ${task_id}; retrying terminal API call"
+        local saved_status saved_result
+        saved_status=$(jq -r '.status // "completed"' < "$result_artifact" 2>/dev/null) || saved_status="completed"
+        saved_result=$(cat "$result_artifact" 2>/dev/null) || saved_result="{}"
+
+        local api_rc=0
+        if [[ "$saved_status" == "failed" ]]; then
+            apiary_fail_task "$hive_id" "$task_id" -e "$saved_result" >/dev/null 2>&1 || api_rc=$?
+        else
+            apiary_complete_task "$hive_id" "$task_id" -r "$saved_result" >/dev/null 2>&1 || api_rc=$?
+        fi
+
+        if [[ $api_rc -eq 0 ]]; then
+            _wake_log "INFO" "lifecycle: terminal API retry succeeded for task ${task_id}"
+            _lifecycle_write_trace "$task_id" "$saved_result"
+            rm -f "$result_artifact"
+            rm -f "${pending_dir}/${task_id}.json"
+            rm -f "${pending_dir}/${task_id}.claimed"
+            return 0
+        elif [[ $api_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            # 409 on terminal retry = remote state already terminal.
+            # Our saved result is moot — clean up local artifacts.
+            _wake_log "INFO" "lifecycle: terminal retry 409 for task ${task_id}; remote already terminal — reconciled"
+            _lifecycle_write_trace "$task_id" "$saved_result"
+            rm -f "$result_artifact"
+            rm -f "${pending_dir}/${task_id}.json"
+            rm -f "${pending_dir}/${task_id}.claimed"
+            return 0
+        else
+            _wake_log "WARN" "lifecycle: terminal API retry still failing for task ${task_id}; preserving"
+            return 1
+        fi
+    fi
+
+    # ── Step 1: Atomic claim ──────────────────────────────────
+    local claim_rc=0
+    local claimed_marker="${pending_dir}/${task_id}.claimed"
+    apiary_claim_task "$hive_id" "$task_id" >/dev/null 2>&1 || claim_rc=$?
+
+    if [[ $claim_rc -ne 0 ]]; then
+        if [[ $claim_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            if [[ -f "$claimed_marker" ]]; then
+                # We previously claimed this task but lost the result
+                # artifact (crash between process and artifact write).
+                # The task is stuck in_progress on the server — report
+                # failure so it can be released/retried server-side.
+                _wake_log "WARN" "lifecycle: task ${task_id} 409 with local .claimed marker; reporting failure to release"
+                local release_rc=0
+                apiary_fail_task "$hive_id" "$task_id" -e \
+                    '{"error":"daemon recovery: lost result artifact after claim"}' >/dev/null 2>&1 || release_rc=$?
+                if [[ $release_rc -eq 0 ]]; then
+                    rm -f "$claimed_marker"
+                    rm -f "${pending_dir}/${task_id}.json"
+                    return 0
+                elif [[ $release_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+                    # 409 = task already terminal (foreign agent completed/failed it).
+                    # Clean up our stale local artifacts.
+                    _wake_log "INFO" "lifecycle: task ${task_id} release got 409; remote already terminal — reconciled"
+                    rm -f "$claimed_marker"
+                    rm -f "${pending_dir}/${task_id}.json"
+                    return 0
+                else
+                    _wake_log "WARN" "lifecycle: release/fail API error for task ${task_id} (rc=${release_rc}); preserving markers for retry"
+                    return 1
+                fi
+            fi
+            # No .claimed marker → ownership uncertain.  We may have crashed
+            # between a successful claim and writing the .claimed marker.
+            # Quarantine instead of hard-deleting to preserve local recovery.
+            _wake_log "WARN" "lifecycle: task ${task_id} got 409 without .claimed marker; quarantining for recovery"
+            mkdir -p "${pending_dir}/quarantine" 2>/dev/null || true
+            mv -f "${pending_dir}/${task_id}.json" "${pending_dir}/quarantine/${task_id}.json" 2>/dev/null || true
+            return 0
+        fi
+        _wake_log "WARN" "lifecycle: failed to claim task ${task_id} (rc=${claim_rc}); will retry"
+        return 1
+    fi
+
+    # Write .claimed marker so we can distinguish our own stale claims
+    # from foreign claims on subsequent 409 encounters.
+    echo "$task_id" > "$claimed_marker" 2>/dev/null || true
+
+    _wake_log "INFO" "lifecycle: claimed task ${task_id}"
+
+    # ── Step 2: Process via webhook wake bridge ───────────────
+    local process_status="completed"
+    local process_summary=""
+
+    local parsed=""
+    if parsed=$(_wake_parse_pr_comment "$task_json") && [[ -n "$parsed" ]]; then
+        # PR comment — attempt delivery
+        local comment_id
+        comment_id=$(echo "$parsed" | jq -r '.comment_id // empty' 2>/dev/null) || comment_id=""
+        local dedup_key="${task_id}:${comment_id}"
+
+        if _wake_is_seen "$dedup_key"; then
+            process_summary="deduplicated: already processed within debounce window"
+        else
+            # Build wake message (mirrors apiary_webhook_wake logic)
+            local repo pr_number comment_url severity comment_body
+            repo=$(echo "$parsed" | jq -r '.repo // "unknown"' 2>/dev/null) || repo="unknown"
+            pr_number=$(echo "$parsed" | jq -r '.pr_number // ""' 2>/dev/null) || pr_number=""
+            comment_url=$(echo "$parsed" | jq -r '.comment_url // ""' 2>/dev/null) || comment_url=""
+            severity=$(echo "$parsed" | jq -r '.severity // "normal"' 2>/dev/null) || severity="normal"
+            comment_body=$(echo "$parsed" | jq -r '.comment_body // ""' 2>/dev/null) || comment_body=""
+            [[ ${#comment_body} -gt 500 ]] && comment_body="${comment_body:0:497}..."
+
+            local message
+            message=$(printf 'Webhook task %s: PR comment on %s #%s [%s]\nComment: %s\nURL: %s' \
+                "$task_id" "$repo" "$pr_number" "$severity" "$comment_body" "$comment_url")
+
+            # Deliver: wake + optional alert
+            local wake_ok=0 alert_ok=0
+
+            if [[ "${_WAKE_ENABLED:-false}" == "true" ]] && [[ -n "${_WAKE_SESSION:-}" ]]; then
+                if _wake_send "$_WAKE_SESSION" "$message"; then
+                    wake_ok=1
+                fi
+            fi
+
+            if [[ "${_WAKE_ALERT_ENABLED:-false}" == "true" ]] && [[ -n "${_WAKE_ALERT_TELEGRAM:-}" ]]; then
+                local alert_icon="🔔"
+                case "$severity" in
+                    urgent) alert_icon="🚨" ;;
+                    high)   alert_icon="⚠️" ;;
+                    low)    alert_icon="ℹ️" ;;
+                esac
+                local alert_body="$comment_body"
+                [[ ${#alert_body} -gt 200 ]] && alert_body="${alert_body:0:197}..."
+                local alert_msg
+                alert_msg=$(printf '%s PR comment on %s #%s [%s]\n%s\n%s' \
+                    "$alert_icon" "$repo" "$pr_number" "$severity" "$alert_body" "$comment_url")
+
+                if _wake_send_alert "${_WAKE_ALERT_TELEGRAM}" "${_WAKE_ALERT_CHANNEL:-telegram}" "$alert_msg"; then
+                    alert_ok=1
+                fi
+            fi
+
+            if [[ $wake_ok -eq 1 ]] || [[ $alert_ok -eq 1 ]]; then
+                _wake_mark_seen "$dedup_key"
+                _lifecycle_wake_delivered=1
+                process_summary="delivered: wake=${wake_ok} alert=${alert_ok}"
+            elif [[ "${_WAKE_ENABLED:-false}" != "true" ]] && [[ "${_WAKE_ALERT_ENABLED:-false}" != "true" ]]; then
+                # No delivery channels configured — acknowledge the task
+                process_summary="no delivery channels enabled; task acknowledged"
+            else
+                process_status="failed"
+                process_summary="all delivery channels failed"
+            fi
+        fi
+    else
+        # Not a PR comment — complete with filter note
+        process_summary="filtered: not a PR comment webhook"
+    fi
+
+    # ── Step 3: Complete or fail in Apiary ────────────────────
+    local now_ts
+    now_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')
+    local result_json
+
+    if [[ "$process_status" == "completed" ]]; then
+        result_json=$(jq -n \
+            --arg id "$task_id" \
+            --arg summary "$process_summary" \
+            --arg ts "$now_ts" \
+            '{"task_id":$id,"status":"completed","processed_by":"daemon","summary":$summary,"completed_at":$ts}' \
+            2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"completed\"}"
+
+        if apiary_complete_task "$hive_id" "$task_id" -r "$result_json" >/dev/null 2>&1; then
+            _wake_log "INFO" "lifecycle: completed task ${task_id}: ${process_summary}"
+        else
+            _wake_log "WARN" "lifecycle: task ${task_id} processed but completion API call failed; saving result artifact for retry"
+            echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            return 1
+        fi
+    else
+        result_json=$(jq -n \
+            --arg id "$task_id" \
+            --arg err "$process_summary" \
+            --arg ts "$now_ts" \
+            '{"task_id":$id,"status":"failed","error":$err,"failed_at":$ts}' \
+            2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"failed\"}"
+
+        if apiary_fail_task "$hive_id" "$task_id" -e "$result_json" >/dev/null 2>&1; then
+            _wake_log "INFO" "lifecycle: failed task ${task_id}: ${process_summary}"
+        else
+            _wake_log "WARN" "lifecycle: task ${task_id} process failed and fail API call also failed; saving result artifact for retry"
+            echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    # ── Step 4: Persist trace (only after successful API update) ──
+    _lifecycle_write_trace "$task_id" "$result_json"
+
+    # ── Step 5: Clean up pending file + all state markers ────
+    rm -f "${pending_dir}/${task_id}.json"
+    rm -f "${pending_dir}/${task_id}.result.json"
+    rm -f "${pending_dir}/${task_id}.claimed"
+
+    return 0
+}
+
+# ── Retry sweep for stuck pending tasks ──────────────────────
+
+# Retry any pending webhook_handler tasks that remain from prior polls.
+# Called by the daemon on each poll cycle to unstick tasks whose claim
+# failed with a retryable error (network timeout, etc.).
+#
+# Safe to call repeatedly: lifecycle's atomic claim prevents
+# double-processing (409 → skip gracefully).  Result artifacts
+# (.result.json) are retried directly without re-claiming.
+_lifecycle_retry_pending_handlers() {
+    local pending_dir="${PENDING_DIR:-${_LIFECYCLE_CONFIG_DIR}/pending}"
+    [[ -d "$pending_dir" ]] || return 0
+
+    local pending_file
+    for pending_file in "${pending_dir}"/*.json; do
+        [[ -f "$pending_file" ]] || continue
+
+        local ptask_json ptask_id ptask_type
+        ptask_json=$(cat "$pending_file" 2>/dev/null) || continue
+        ptask_id=$(basename "$pending_file" .json)
+        ptask_type=$(echo "$ptask_json" | jq -r '.type' 2>/dev/null) || continue
+
+        [[ "$ptask_type" == "webhook_handler" ]] || continue
+
+        _lifecycle_process_webhook_handler "$ptask_json" "$ptask_id" || true
+        # Count successful wake/alert deliveries from retry path
+        if [[ "${_lifecycle_wake_delivered:-0}" -eq 1 ]]; then
+            _stats_wakes_sent=$(( ${_stats_wakes_sent:-0} + 1 ))
+        fi
+    done
+}
