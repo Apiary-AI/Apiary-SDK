@@ -152,7 +152,10 @@ _wake_parse_pr_comment() {
     # itself for flat/legacy payloads.
     local github_body
     github_body=$(echo "$event_payload" | jq -r '.body // empty' 2>/dev/null) || true
-    if [[ -z "$github_body" ]] || [[ "$github_body" == "null" ]]; then
+    # Fall back to event_payload when .body is absent, null, empty, or
+    # whitespace-only.  Without this trim check, a whitespace .body would
+    # shadow valid nested fields in event_payload (P2 fix).
+    if [[ -z "$github_body" ]] || [[ "$github_body" == "null" ]] || [[ ! "$github_body" =~ [^[:space:]] ]]; then
         github_body="$event_payload"
     fi
 

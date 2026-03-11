@@ -1112,7 +1112,7 @@ assert_eq "$([ -f "${PENDING_DIR}/sm-apifail.result.json" ] && echo exists || ec
 # State machine: 409 with .claimed marker → recovery via fail API
 # ═══════════════════════════════════════════════════════════════
 
-describe "State machine — 409 with .claimed marker recovers via fail API"
+describe "State machine — 409 with .claimed marker re-processes (crash recovery)"
 
 _setup
 
@@ -1129,8 +1129,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "sm-409own: returns 0 (recovery succeeded)"
-assert_eq "$_FAIL_CALLS" "1" "sm-409own: fail API called to release task"
-assert_contains "$_FAIL_LAST_ERROR" "daemon recovery" "sm-409own: error mentions recovery"
+# P1 fix: re-processes instead of force-failing — task should be completed, not failed
+assert_eq "$_COMPLETE_CALLS" "1" "sm-409own: complete called (re-processed successfully)"
+assert_eq "$_FAIL_CALLS" "0" "sm-409own: fail NOT called (no longer force-fails)"
 # Both markers should be cleaned up
 assert_eq "$([ -f "${PENDING_DIR}/sm-409own.claimed" ] && echo exists || echo removed)" "removed" \
     "sm-409own: .claimed marker removed after recovery"
@@ -1231,23 +1232,29 @@ assert_eq "$([ -f "${PENDING_DIR}/sm-round.claimed" ] && echo exists || echo rem
 # .claimed recovery — API error preserves markers
 # ═══════════════════════════════════════════════════════════════
 
-describe "State machine — 409 with .claimed marker: release API error preserves markers"
+describe "State machine — 409 with .claimed marker: re-processes even when fail API would error"
 
 _setup
 
 echo "sm-release-err" > "${PENDING_DIR}/sm-release-err.claimed"
 
-# Mock: claim returns 409, fail_task returns network error
+# P1 fix: claim returns 409, but re-processing falls through to Step 2.
+# fail_task is no longer called in the 409+.claimed path — complete is called.
 apiary_claim_task() {
     _CLAIM_CALLS=$((_CLAIM_CALLS + 1))
     return $APIARY_ERR_CONFLICT
 }
 apiary_fail_task() {
     _FAIL_CALLS=$((_FAIL_CALLS + 1))
-    return 1  # network error
+    return 1
 }
 apiary_complete_task() {
     _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
+    _COMPLETE_LAST_TASK="$2"
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;; *) shift ;; esac
+    done
     return 0
 }
 
@@ -1259,19 +1266,20 @@ _lifecycle_process_webhook_handler "$task_json" "sm-release-err"
 rc=$?
 set -e
 
-assert_eq "$rc" "1" "release-err: returns 1 (retryable failure)"
-assert_eq "$_FAIL_CALLS" "1" "release-err: fail API attempted"
-assert_eq "$([ -f "${PENDING_DIR}/sm-release-err.claimed" ] && echo exists || echo removed)" "exists" \
-    "release-err: .claimed marker preserved for retry"
-assert_eq "$([ -f "${PENDING_DIR}/sm-release-err.json" ] && echo exists || echo removed)" "exists" \
-    "release-err: pending file preserved for retry"
+assert_eq "$rc" "0" "release-err: returns 0 (re-processed successfully)"
+assert_eq "$_FAIL_CALLS" "0" "release-err: fail API NOT called (re-processed instead)"
+assert_eq "$_COMPLETE_CALLS" "1" "release-err: complete called (task re-processed)"
+assert_eq "$([ -f "${PENDING_DIR}/sm-release-err.claimed" ] && echo exists || echo removed)" "removed" \
+    "release-err: .claimed marker cleaned up after re-processing"
+assert_eq "$([ -f "${PENDING_DIR}/sm-release-err.json" ] && echo exists || echo removed)" "removed" \
+    "release-err: pending file cleaned up after re-processing"
 
 
 # ═══════════════════════════════════════════════════════════════
-# .claimed recovery — 409 = reconciled success
+# .claimed recovery — re-processes instead of release attempts
 # ═══════════════════════════════════════════════════════════════
 
-describe "State machine — 409 with .claimed marker: release gets 409 = reconciled"
+describe "State machine — 409 with .claimed marker: re-processes and completes"
 
 _setup
 
@@ -1283,10 +1291,15 @@ apiary_claim_task() {
 }
 apiary_fail_task() {
     _FAIL_CALLS=$((_FAIL_CALLS + 1))
-    return $APIARY_ERR_CONFLICT  # 409 = already terminal
+    return 0
 }
 apiary_complete_task() {
     _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
+    _COMPLETE_LAST_TASK="$2"
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;; *) shift ;; esac
+    done
     return 0
 }
 
@@ -1298,8 +1311,9 @@ _lifecycle_process_webhook_handler "$task_json" "sm-release-409"
 rc=$?
 set -e
 
-assert_eq "$rc" "0" "release-409: returns 0 (reconciled success)"
-assert_eq "$_FAIL_CALLS" "1" "release-409: fail API attempted"
+assert_eq "$rc" "0" "release-409: returns 0 (re-processed)"
+assert_eq "$_FAIL_CALLS" "0" "release-409: fail NOT called (re-processed instead)"
+assert_eq "$_COMPLETE_CALLS" "1" "release-409: complete called (task re-processed)"
 assert_eq "$([ -f "${PENDING_DIR}/sm-release-409.claimed" ] && echo exists || echo removed)" "removed" \
     "release-409: .claimed marker cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/sm-release-409.json" ] && echo exists || echo removed)" "removed" \
@@ -1572,6 +1586,124 @@ echo "$task_json" > "${PENDING_DIR}/retry-claimfail.json"
 _lifecycle_retry_pending_handlers
 
 assert_eq "${_stats_wakes_sent}" "0" "retry-claimfail: _stats_wakes_sent stays 0 on claim failure"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P1: 409+.claimed crash recovery — re-processes, delivers wake
+# ═══════════════════════════════════════════════════════════════
+
+describe "P1 — 409+.claimed re-processes and delivers wake (no reminder loss)"
+
+_setup
+_CLAIM_RC=$APIARY_ERR_CONFLICT
+
+# Pre-create .claimed marker (simulates crash after claim, before processing)
+echo "p1-recover" > "${PENDING_DIR}/p1-recover.claimed"
+
+task_json=$(_make_pr_comment_task "p1-recover" 20001 "org/p1" 201 "Crash recovery wake")
+echo "$task_json" > "${PENDING_DIR}/p1-recover.json"
+
+set +e
+_lifecycle_process_webhook_handler "$task_json" "p1-recover"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "p1-recover: returns 0"
+assert_eq "$_COMPLETE_CALLS" "1" "p1-recover: task completed (wake delivered)"
+assert_eq "$_FAIL_CALLS" "0" "p1-recover: fail NOT called (no force-fail)"
+assert_eq "${_lifecycle_wake_delivered}" "1" "p1-recover: wake was delivered"
+assert_contains "$_COMPLETE_LAST_RESULT" "delivered" "p1-recover: result confirms delivery"
+assert_eq "$([ -f "${PENDING_DIR}/p1-recover.claimed" ] && echo exists || echo removed)" "removed" \
+    "p1-recover: .claimed marker cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/p1-recover.json" ] && echo exists || echo removed)" "removed" \
+    "p1-recover: pending file cleaned up"
+
+
+describe "P1 — 409+.claimed re-processes; delivery failure still marks task failed"
+
+_setup
+_CLAIM_RC=$APIARY_ERR_CONFLICT
+export APIARY_WAKE_ENABLED="true"
+export APIARY_WAKE_SESSION="test-session"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+source "${SCRIPT_DIR}/../bin/apiary-task-lifecycle.sh"
+
+# Pre-create .claimed marker
+echo "p1-delfail" > "${PENDING_DIR}/p1-delfail.claimed"
+
+# Mock: claim 409, wake delivery fails, fail API succeeds
+apiary_claim_task() {
+    _CLAIM_CALLS=$((_CLAIM_CALLS + 1))
+    return $APIARY_ERR_CONFLICT
+}
+apiary_complete_task() {
+    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;; *) shift ;; esac
+    done
+    return 0
+}
+apiary_fail_task() {
+    _FAIL_CALLS=$((_FAIL_CALLS + 1))
+    shift 2
+    while [[ $# -gt 0 ]]; do
+        case "$1" in -e) _FAIL_LAST_ERROR="$2"; shift 2 ;; *) shift ;; esac
+    done
+    return 0
+}
+_wake_send() { return 1; }
+openclaw() { return 1; }
+export -f openclaw 2>/dev/null || true
+
+task_json=$(_make_pr_comment_task "p1-delfail" 20002 "org/p1" 202 "Delivery will fail")
+echo "$task_json" > "${PENDING_DIR}/p1-delfail.json"
+
+set +e
+_lifecycle_process_webhook_handler "$task_json" "p1-delfail"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "p1-delfail: returns 0 (fail-soft)"
+assert_eq "$_FAIL_CALLS" "1" "p1-delfail: fail called (delivery failed)"
+assert_eq "$_COMPLETE_CALLS" "0" "p1-delfail: complete NOT called (delivery failed)"
+assert_eq "${_lifecycle_wake_delivered}" "0" "p1-delfail: wake not delivered"
+assert_eq "$([ -f "${PENDING_DIR}/p1-delfail.claimed" ] && echo exists || echo removed)" "removed" \
+    "p1-delfail: .claimed marker cleaned up"
+
+
+describe "P1 — 409+.claimed with terminal API failure saves artifact for retry"
+
+_setup
+
+echo "p1-apifail" > "${PENDING_DIR}/p1-apifail.claimed"
+
+apiary_claim_task() {
+    _CLAIM_CALLS=$((_CLAIM_CALLS + 1))
+    return $APIARY_ERR_CONFLICT
+}
+apiary_complete_task() {
+    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
+    return 1  # terminal API fails
+}
+apiary_fail_task() {
+    _FAIL_CALLS=$((_FAIL_CALLS + 1))
+    return 0
+}
+
+task_json=$(_make_pr_comment_task "p1-apifail" 20003 "org/p1" 203 "API will fail")
+echo "$task_json" > "${PENDING_DIR}/p1-apifail.json"
+
+set +e
+_lifecycle_process_webhook_handler "$task_json" "p1-apifail"
+rc=$?
+set -e
+
+assert_eq "$rc" "1" "p1-apifail: returns 1 (retryable)"
+assert_eq "$([ -f "${PENDING_DIR}/p1-apifail.result.json" ] && echo exists || echo missing)" "exists" \
+    "p1-apifail: result artifact saved for retry"
+assert_eq "$([ -f "${PENDING_DIR}/p1-apifail.claimed" ] && echo exists || echo missing)" "exists" \
+    "p1-apifail: .claimed marker preserved for next retry"
 
 
 # ═══════════════════════════════════════════════════════════════
