@@ -2,17 +2,21 @@
 # apiary-webhook-wake.sh — Bridge: wake OpenClaw session on actionable webhook tasks.
 #
 # When the daemon detects a new pending webhook_handler task, this module
-# parses PR comment metadata from the event payload and POSTs to the
-# OpenClaw gateway HTTP API to auto-wake the assistant with actionable context.
+# parses PR comment metadata from the event payload and invokes the
+# OpenClaw CLI to auto-wake the assistant with actionable context.
 #
-# Transport: gateway HTTP only.  The OpenClaw CLI does not expose a
-# session-send subcommand in the current runtime, so the bridge uses
-# direct HTTP POST to the gateway /tools/invoke endpoint exclusively.
-# If the gateway is unreachable the bridge fails fast with diagnostics.
+# Transport: CLI-direct (default).
+#   Wake:  openclaw agent --session-id <id> --message <text>
+#   Alert: openclaw message send --channel <ch> --target <tgt> --message <text>
+#
+# The gateway HTTP path (/tools/invoke) is available as an opt-in fallback
+# via APIARY_WAKE_TRANSPORT=gateway, but is off by default because it
+# requires a running gateway with valid auth tokens and has historically
+# failed with 401 errors.
 #
 # Features:
 #   - Idempotent: tracks seen task+comment IDs to prevent duplicate wakeups
-#   - Fail-fast: gateway connectivity validated at init; errors surface immediately
+#   - Fail-fast: CLI availability validated at init; errors surface immediately
 #   - Fail-soft: parsing/invoke failures are logged but never crash the daemon
 #   - Configurable: enable/disable, session target, log path, debounce
 #
@@ -22,16 +26,21 @@
 #   APIARY_WAKE_LOG              — Log file path (default: ~/.config/apiary/wake.log)
 #   APIARY_WAKE_DEBOUNCE_SECS   — Min seconds between wakes for same comment (default: 5)
 #   APIARY_CONFIG_DIR            — Config directory (default: ~/.config/apiary)
+#   APIARY_WAKE_TRANSPORT        — "cli" (default) or "gateway"
 #
-# Gateway transport (canonical wake path):
+# CLI transport (default — requires openclaw binary in PATH):
+#   Uses `openclaw agent` for session wake and `openclaw message send` for alerts.
+#   No gateway or auth tokens required.
+#
+# Gateway transport (opt-in fallback via APIARY_WAKE_TRANSPORT=gateway):
 #   APIARY_WAKE_GATEWAY_URL      — OpenClaw gateway base URL (default: http://localhost:3223)
 #   APIARY_WAKE_GATEWAY_TOKEN    — Bearer token for gateway auth (optional)
 #   APIARY_WAKE_GATEWAY_TIMEOUT  — HTTP timeout in seconds (default: 5)
 #
-# Visible alert (dual-delivery: sends user-visible Telegram message alongside internal wake):
-#   APIARY_WAKE_ALERT_ENABLED    — "true" to enable visible Telegram alerts (default: "false")
-#   APIARY_WAKE_ALERT_TELEGRAM   — Telegram chat ID or username target (required if alert enabled)
-#   APIARY_WAKE_ALERT_CHANNEL    — Optional channel name for routing (default: "telegram")
+# Visible alert (dual-delivery: sends user-visible message alongside internal wake):
+#   APIARY_WAKE_ALERT_ENABLED    — "true" to enable visible alerts (default: "false")
+#   APIARY_WAKE_ALERT_TELEGRAM   — Chat ID or username target (required if alert enabled)
+#   APIARY_WAKE_ALERT_CHANNEL    — Channel for routing (default: "telegram")
 
 # ── Source Shell SDK (guard against re-sourcing) ────────────────
 if [[ -z "${_APIARY_SDK_LOADED:-}" ]]; then
@@ -59,12 +68,16 @@ _WAKE_CONFIG_DIR="${APIARY_CONFIG_DIR:-${HOME}/.config/apiary}"
 _WAKE_LOG="${APIARY_WAKE_LOG:-${_WAKE_CONFIG_DIR}/wake.log}"
 _WAKE_DEBOUNCE_SECS="${APIARY_WAKE_DEBOUNCE_SECS:-5}"
 _WAKE_SEEN_FILE="${_WAKE_CONFIG_DIR}/wake_seen.json"
+_WAKE_TRANSPORT_RAW="${APIARY_WAKE_TRANSPORT:-cli}"
+_WAKE_TRANSPORT="$(printf '%s' "${_WAKE_TRANSPORT_RAW}" | tr '[:upper:]' '[:lower:]')"
+_WAKE_TRANSPORT_INVALID=0
 _WAKE_GATEWAY_URL="${APIARY_WAKE_GATEWAY_URL:-http://localhost:3223}"
 _WAKE_GATEWAY_TOKEN="${APIARY_WAKE_GATEWAY_TOKEN:-}"
 _WAKE_GATEWAY_TIMEOUT="${APIARY_WAKE_GATEWAY_TIMEOUT:-5}"
 _WAKE_ALERT_ENABLED="${APIARY_WAKE_ALERT_ENABLED:-false}"
 _WAKE_ALERT_TELEGRAM="${APIARY_WAKE_ALERT_TELEGRAM:-}"
 _WAKE_ALERT_CHANNEL="${APIARY_WAKE_ALERT_CHANNEL:-telegram}"
+_WAKE_CLI_TIMEOUT="${APIARY_WAKE_CLI_TIMEOUT:-30}"
 
 # ── Logging ────────────────────────────────────────────────────
 
@@ -81,6 +94,43 @@ _wake_log() {
         echo "$msg" >> "$_WAKE_LOG" 2>/dev/null || true
     fi
 }
+
+# ── CLI command validation ────────────────────────────────────
+
+# Validate that the openclaw CLI binary is available in PATH.
+# Called once at source time when transport=cli.
+# Logs ERROR and sets _WAKE_CLI_AVAILABLE=0 if missing.
+# Subcommand availability (agent, message send) is validated at
+# invocation time — _wake_send_cli and _wake_send_alert_cli will
+# fail-fast with diagnostic logs if the subcommand exits non-zero.
+_wake_validate_cli() {
+    _WAKE_CLI_AVAILABLE=0
+
+    if ! command -v openclaw >/dev/null 2>&1; then
+        _wake_log "ERROR" "openclaw binary not found in PATH; CLI wake transport unavailable — install openclaw or set APIARY_WAKE_TRANSPORT=gateway"
+        return 1
+    fi
+
+    _WAKE_CLI_AVAILABLE=1
+    return 0
+}
+
+# Validate transport and run source-time checks
+case "$_WAKE_TRANSPORT" in
+    cli)
+        # Avoid startup noise when wake is disabled. Validate eagerly only
+        # when wake processing is enabled; otherwise validate lazily at first use.
+        if [[ "$_WAKE_ENABLED" == "true" ]]; then
+            _wake_validate_cli || true
+        fi
+        ;;
+    gateway)
+        ;;
+    *)
+        _WAKE_TRANSPORT_INVALID=1
+        _wake_log "ERROR" "Invalid APIARY_WAKE_TRANSPORT='${_WAKE_TRANSPORT_RAW}'. Supported values: cli, gateway"
+        ;;
+esac
 
 # ── Deduplication ──────────────────────────────────────────────
 
@@ -248,7 +298,37 @@ _wake_parse_pr_comment() {
         }' 2>/dev/null || return 1
 }
 
-# ── Wake invocation ────────────────────────────────────────────
+# ── Wake invocation — CLI transport ───────────────────────────
+
+# Send a wake message via openclaw agent CLI command.
+# Command: openclaw agent --session-id <id> --message <text>
+_wake_send_cli() {
+    local session_id="$1"
+    local message="$2"
+
+    if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
+        _wake_validate_cli >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
+        _wake_log "ERROR" "CLI transport requested but openclaw CLI is not available; run _wake_validate_cli or set APIARY_WAKE_TRANSPORT=gateway"
+        return 1
+    fi
+
+    local output
+    output=$(timeout "$_WAKE_CLI_TIMEOUT" openclaw agent \
+        --session-id "$session_id" \
+        --message "$message" \
+        2>&1) || {
+        local rc=$?
+        _wake_log "ERROR" "openclaw agent failed (rc=${rc}) session=${session_id}: ${output:-<no output>}"
+        return 1
+    }
+
+    return 0
+}
+
+# ── Wake invocation — gateway transport ───────────────────────
 
 # POST directly to the OpenClaw local gateway HTTP API.
 # Endpoint: POST {gateway}/tools/invoke  body: {"tool":"session_send","args":{"sessionKey":"...","message":"..."}}
@@ -293,18 +373,59 @@ _wake_send_gateway() {
     return 1
 }
 
-# Send a wake message to the target session via gateway HTTP.
-# This is the canonical (and only) wake path for the current OpenClaw runtime.
-# The CLI does not support session send subcommands (sessions_send, session send
-# are all invalid in this version).  Fail fast with diagnostics.
+# ── Wake send dispatcher ──────────────────────────────────────
+
+# Send a wake message to the target session using the configured transport.
+# Default: CLI direct.  Fallback: gateway HTTP (opt-in).
 _wake_send() {
     local session_id="$1"
     local message="$2"
 
-    _wake_send_gateway "$session_id" "$message"
+    if [[ "${_WAKE_TRANSPORT_INVALID:-0}" -eq 1 ]]; then
+        _wake_log "ERROR" "Invalid wake transport configuration; refusing to dispatch wake"
+        return 1
+    fi
+
+    if [[ "$_WAKE_TRANSPORT" == "gateway" ]]; then
+        _wake_send_gateway "$session_id" "$message"
+    else
+        _wake_send_cli "$session_id" "$message"
+    fi
 }
 
-# ── Visible alert (Telegram) ──────────────────────────────────
+# ── Visible alert — CLI transport ─────────────────────────────
+
+# Send a visible alert via openclaw message send CLI command.
+# Command: openclaw message send --channel <ch> --target <tgt> --message <text>
+_wake_send_alert_cli() {
+    local target="$1"
+    local channel="$2"
+    local message="$3"
+
+    if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
+        _wake_validate_cli >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
+        _wake_log "ERROR" "CLI transport requested but openclaw CLI is not available for alerts"
+        return 1
+    fi
+
+    local output
+    output=$(timeout "$_WAKE_CLI_TIMEOUT" openclaw message send \
+        --channel "$channel" \
+        --target "$target" \
+        --message "$message" \
+        2>&1) || {
+        local rc=$?
+        _wake_log "ERROR" "openclaw message send failed (rc=${rc}) channel=${channel} target=${target}: ${output:-<no output>}"
+        return 1
+    }
+
+    return 0
+}
+
+# ── Visible alert — gateway transport ─────────────────────────
 
 # POST alert via gateway /tools/invoke with message tool (action=send).
 _wake_send_alert_gateway() {
@@ -349,14 +470,25 @@ _wake_send_alert_gateway() {
     return 1
 }
 
-# Send a visible alert via gateway HTTP.
+# ── Alert send dispatcher ─────────────────────────────────────
+
+# Send a visible alert using the configured transport.
 # Returns 0 on success, 1 on failure (caller should treat as non-fatal).
 _wake_send_alert() {
     local target="$1"
     local channel="$2"
     local message="$3"
 
-    _wake_send_alert_gateway "$target" "$channel" "$message"
+    if [[ "${_WAKE_TRANSPORT_INVALID:-0}" -eq 1 ]]; then
+        _wake_log "ERROR" "Invalid wake transport configuration; refusing to dispatch alert"
+        return 1
+    fi
+
+    if [[ "$_WAKE_TRANSPORT" == "gateway" ]]; then
+        _wake_send_alert_gateway "$target" "$channel" "$message"
+    else
+        _wake_send_alert_cli "$target" "$channel" "$message"
+    fi
 }
 
 # ── Main entry point ──────────────────────────────────────────
@@ -449,7 +581,7 @@ apiary_webhook_wake() {
         _wake_log "WARN" "Failed to wake session ${_WAKE_SESSION} for task ${task_id}"
     fi
 
-    # Send visible Telegram alert (dual-delivery, fail-soft)
+    # Send visible alert (dual-delivery, fail-soft)
     local alert_ok=0
     if [[ "$_WAKE_ALERT_ENABLED" == "true" ]] && [[ -n "$_WAKE_ALERT_TELEGRAM" ]]; then
         # Build a short user-visible alert message
