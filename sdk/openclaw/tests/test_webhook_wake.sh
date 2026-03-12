@@ -7,8 +7,10 @@
 #   - Idempotency / deduplication
 #   - Wake invocation conditions (enabled/disabled, session set/unset)
 #   - Fail-soft on malformed payloads
-#   - Gateway-only transport (no CLI subcommand attempts)
-#   - Fail-fast diagnostics when gateway is unreachable
+#   - CLI-direct transport (openclaw agent / openclaw message send)
+#   - Gateway transport (opt-in fallback)
+#   - Fail-fast diagnostics when CLI is unavailable
+#   - Transport selection via APIARY_WAKE_TRANSPORT
 
 set -euo pipefail
 
@@ -32,18 +34,22 @@ _setup() {
     export APIARY_WAKE_SESSION="test-session-123"
     export APIARY_WAKE_LOG="${_tmp_dir}/wake.log"
     export APIARY_WAKE_DEBOUNCE_SECS="5"
+    export APIARY_WAKE_TRANSPORT="cli"
     rm -f "${_tmp_dir}/wake_seen.json"
     rm -f "${_tmp_dir}/wake.log"
     _WAKE_INVOCATIONS=0
     _WAKE_LAST_MESSAGE=""
     _WAKE_LAST_SESSION=""
 
+    # Clear any mock functions from prior tests so re-source sees the real binaries
+    unset -f openclaw timeout curl 2>/dev/null || true
+
     # Re-source to pick up env changes
     source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
     # Override _wake_send with a tracking mock.
-    # We mock at this level (not curl) because _wake_send_gateway calls curl
-    # inside $(...) which runs in a subshell — variable updates would be lost.
+    # We mock at this level (not the CLI binary) because openclaw calls
+    # run in subshells — variable updates would be lost.
     _wake_send() {
         local session_id="$1"
         local message="$2"
@@ -502,7 +508,7 @@ assert_ne "$seen" "0" "expired entry is not seen (debounce=0)"
 # Wake invocation tests
 # ═══════════════════════════════════════════════════════════════
 
-describe "Wake — sends via gateway HTTP (session_send)"
+describe "Wake — sends via CLI transport (openclaw agent)"
 
 _setup
 _WAKE_INVOCATIONS=0
@@ -510,7 +516,7 @@ task_json=$(_make_pr_comment_task "wake-t1" 100 "org/repo" 3 "Please review")
 
 apiary_webhook_wake "$task_json" "wake-t1"
 
-assert_eq "$_WAKE_INVOCATIONS" "1" "sends exactly one wake via gateway"
+assert_eq "$_WAKE_INVOCATIONS" "1" "sends exactly one wake via CLI"
 assert_eq "$_WAKE_LAST_SESSION" "test-session-123" "targets correct session"
 assert_contains "$_WAKE_LAST_MESSAGE" "wake-t1" "message includes task ID"
 assert_contains "$_WAKE_LAST_MESSAGE" "org/repo" "message includes repo"
@@ -656,97 +662,318 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════
-# Gateway transport tests
+# CLI transport tests
 # ═══════════════════════════════════════════════════════════════
 
-describe "Wake — gateway path (curl succeeds)"
+describe "CLI transport — _wake_send_cli invokes openclaw agent"
 
 _setup
-_WAKE_INVOCATIONS=0
-task_json=$(_make_pr_comment_task "wake-gw1" 400 "org/gateway" 10 "Gateway path test")
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
-# The mock `curl` function defined above is in scope → gateway succeeds
-apiary_webhook_wake "$task_json" "wake-gw1"
+# Mock openclaw binary to capture args
+_cli_capture_dir="${_tmp_dir}/cli_capture"
+mkdir -p "$_cli_capture_dir"
 
-assert_eq "$_WAKE_INVOCATIONS" "1" "gateway: session_send invoked via HTTP"
-assert_eq "$_WAKE_LAST_SESSION" "test-session-123" "gateway: correct session"
-assert_contains "$_WAKE_LAST_MESSAGE" "org/gateway" "gateway: message includes repo"
-
-# ── Gateway succeeds: tracked via _wake_send override ─────────
-
-describe "Wake — gateway transport (override _wake_send)"
-
-_setup
-_WAKE_INVOCATIONS=0
-rm -f "${_tmp_dir}/wake_seen.json"
-
-_GATEWAY_INVOCATIONS=0
-_GATEWAY_LAST_SESSION=""
-_GATEWAY_LAST_MESSAGE=""
-
-_wake_send() {
-    local session_id="$1"
-    local message="$2"
-    _GATEWAY_INVOCATIONS=$((_GATEWAY_INVOCATIONS + 1))
-    _GATEWAY_LAST_SESSION="$session_id"
-    _GATEWAY_LAST_MESSAGE="$message"
+openclaw() {
+    echo "$@" > "${_cli_capture_dir}/args"
     return 0
 }
-
-task_json=$(_make_pr_comment_task "wake-gw2" 401 "org/gw-tracked" 11 "Gateway tracked test")
-apiary_webhook_wake "$task_json" "wake-gw2"
-
-assert_eq "$_GATEWAY_INVOCATIONS" "1" "gw-tracked: gateway invoked"
-assert_eq "$_GATEWAY_LAST_SESSION" "test-session-123" "gw-tracked: correct session"
-assert_contains "$_GATEWAY_LAST_MESSAGE" "org/gw-tracked" "gw-tracked: message includes repo"
-
-# ── Gateway fails: fail-fast with diagnostics ─────────────────
-
-describe "Wake — gateway failure (fail-fast with diagnostics)"
-
-_setup
-rm -f "${_tmp_dir}/wake_seen.json"
-rm -f "${_tmp_dir}/wake.log"
-
-_wake_send() {
-    local session_id="$1"
-    local message="$2"
-    _wake_log "ERROR" "gateway request failed (curl error) url=http://localhost:3223/tools/invoke"
-    return 1
+# Mock timeout to passthrough (since it wraps openclaw)
+timeout() {
+    shift  # skip timeout value
+    "$@"
 }
+_WAKE_CLI_AVAILABLE=1
 
-task_json=$(_make_pr_comment_task "wake-fail" 402 "org/fail" 12 "Gateway fail test")
 set +e
-apiary_webhook_wake "$task_json" "wake-fail"
+_wake_send_cli "test-sess-1" "Hello from CLI"
 rc=$?
 set -e
 
-assert_eq "$rc" "0" "gw-fail: returns 0 (fail-soft at caller)"
+assert_eq "$rc" "0" "cli-wake: returns 0 on success"
+_captured_args=$(cat "${_cli_capture_dir}/args" 2>/dev/null || echo "")
+assert_contains "$_captured_args" "agent" "cli-wake: invokes 'agent' subcommand"
+assert_contains "$_captured_args" "--session-id test-sess-1" "cli-wake: passes session-id"
+assert_contains "$_captured_args" "--message Hello from CLI" "cli-wake: passes message"
+
+# ── CLI transport: alert invokes openclaw message send ─────────
+
+describe "CLI transport — _wake_send_alert_cli invokes openclaw message send"
+
+_setup
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+
+_cli_capture_dir="${_tmp_dir}/cli_capture_alert"
+mkdir -p "$_cli_capture_dir"
+
+openclaw() {
+    echo "$@" > "${_cli_capture_dir}/args"
+    return 0
+}
+timeout() {
+    shift
+    "$@"
+}
+_WAKE_CLI_AVAILABLE=1
+
+set +e
+_wake_send_alert_cli "@testuser" "telegram" "Test alert"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "cli-alert: returns 0 on success"
+_captured_args=$(cat "${_cli_capture_dir}/args" 2>/dev/null || echo "")
+assert_contains "$_captured_args" "message send" "cli-alert: invokes 'message send'"
+assert_contains "$_captured_args" "--channel telegram" "cli-alert: passes channel"
+assert_contains "$_captured_args" "--target @testuser" "cli-alert: passes target"
+assert_contains "$_captured_args" "--message Test alert" "cli-alert: passes message"
+
+# ── CLI transport: openclaw failure propagates error ───────────
+
+describe "CLI transport — openclaw failure returns error"
+
+_setup
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+_WAKE_CLI_AVAILABLE=1
+
+openclaw() {
+    echo "error: connection refused" >&2
+    return 1
+}
+timeout() {
+    shift
+    "$@"
+}
+
+set +e
+_wake_send_cli "fail-sess" "will fail" 2>/dev/null
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "cli-fail: returns non-zero on openclaw error"
+
+# ── CLI transport: unavailable CLI returns error with diagnostics ──
+
+describe "CLI transport — unavailable CLI produces fail-fast error"
+
+_setup
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+_WAKE_CLI_AVAILABLE=0
+rm -f "${_tmp_dir}/wake.log"
+
+# Force lazy validation path to fail by mocking missing binary.
+command() {
+    if [[ "$1" == "-v" ]] && [[ "$2" == "openclaw" ]]; then
+        return 1
+    fi
+
+    builtin command "$@"
+}
+
+set +e
+_wake_send_cli "no-cli-sess" "no cli" 2>/dev/null
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "cli-unavail: returns non-zero"
 
 if [[ -f "${_tmp_dir}/wake.log" ]]; then
     log_content=$(cat "${_tmp_dir}/wake.log")
-    assert_contains "$log_content" "gateway" "gw-fail: log mentions gateway"
-    assert_contains "$log_content" "Failed to wake" "gw-fail: log records wake failure"
+    assert_contains "$log_content" "CLI transport requested but openclaw CLI is not available" \
+        "cli-unavail: log contains diagnostic message"
 fi
 
-# ── No CLI attempts: source code contains no openclaw CLI calls ─
+# ── CLI validation: command discovery is hermetic ─────────────
 
-describe "Wake — source code does not invoke openclaw CLI for wake/alert"
-
-# Verify the implementation file contains no openclaw CLI invocations
-# for sessions_send, session send, message.send, or message send.
-_wake_src="${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
-set +e
-_cli_hits=$(grep -cE 'openclaw (sessions_send|session send|message\.send|message send)' "$_wake_src" 2>/dev/null)
-set -e
-assert_eq "${_cli_hits:-0}" "0" "no-cli: source contains no openclaw CLI session/message subcommand calls"
-
-# ── Gateway unit: _wake_send_gateway with mock curl ───────────
-
-describe "Wake — _wake_send_gateway constructs correct request"
+describe "CLI validation — detects openclaw via mocked command discovery"
 
 _setup
-# Re-source to restore original functions after overrides
+
+_cmd_mock_state="present"
+command() {
+    if [[ "$1" == "-v" ]] && [[ "$2" == "openclaw" ]]; then
+        if [[ "${_cmd_mock_state:-}" == "present" ]]; then
+            echo "/mock/bin/openclaw"
+            return 0
+        fi
+
+        return 1
+    fi
+
+    builtin command "$@"
+}
+
+set +e
+_wake_validate_cli 2>/dev/null
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "validate-cli: succeeds when mocked binary is present"
+assert_eq "$_WAKE_CLI_AVAILABLE" "1" "validate-cli: sets _WAKE_CLI_AVAILABLE=1"
+
+# ── CLI validation: missing binary fails fast with diagnostics ─
+
+describe "CLI validation — mocked missing binary fails with diagnostics"
+
+_setup
+rm -f "${_tmp_dir}/wake.log"
+
+_cmd_mock_state="missing"
+command() {
+    if [[ "$1" == "-v" ]] && [[ "$2" == "openclaw" ]]; then
+        return 1
+    fi
+
+    builtin command "$@"
+}
+
+set +e
+_wake_validate_cli 2>/dev/null
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "validate-missing: returns non-zero"
+assert_eq "$_WAKE_CLI_AVAILABLE" "0" "validate-missing: sets _WAKE_CLI_AVAILABLE=0"
+
+if [[ -f "${_tmp_dir}/wake.log" ]]; then
+    log_content=$(cat "${_tmp_dir}/wake.log")
+    assert_contains "$log_content" "openclaw binary not found" \
+        "validate-missing: log contains diagnostic"
+fi
+
+# ── No invalid CLI attempts: source code is clean ─────────────
+
+describe "Wake — source code does not invoke invalid openclaw CLI subcommands"
+
+# Verify the implementation file contains no invalid openclaw CLI invocations
+# (sessions_send, session send as two-word command, message.send with dot)
+_wake_src="${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+set +e
+_cli_hits=$(grep -cE 'openclaw (sessions_send|session send|message\.send)' "$_wake_src" 2>/dev/null)
+set -e
+assert_eq "${_cli_hits:-0}" "0" "no-invalid-cli: source contains no invalid openclaw CLI subcommand calls"
+
+# Verify the source DOES contain the correct CLI commands
+set +e
+_cli_agent_hits=$(grep -c 'openclaw agent' "$_wake_src" 2>/dev/null)
+_cli_msg_hits=$(grep -c 'openclaw message send' "$_wake_src" 2>/dev/null)
+set -e
+assert_ne "${_cli_agent_hits:-0}" "0" "correct-cli: source contains 'openclaw agent' invocation"
+assert_ne "${_cli_msg_hits:-0}" "0" "correct-cli: source contains 'openclaw message send' invocation"
+
+# ═══════════════════════════════════════════════════════════════
+# Transport selection tests
+# ═══════════════════════════════════════════════════════════════
+
+describe "Transport — default transport is CLI"
+
+_setup
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+assert_eq "$_WAKE_TRANSPORT" "cli" "transport-default: defaults to cli"
+
+# ── Transport: disabled wake does not pre-validate CLI at source ──
+
+describe "Transport — disabled wake skips eager CLI validation"
+
+_setup
+export APIARY_WAKE_ENABLED="false"
+export APIARY_WAKE_TRANSPORT="cli"
+rm -f "${_tmp_dir}/wake.log"
+
+# Simulate no openclaw on PATH; source should remain quiet when disabled.
+command() {
+    if [[ "$1" == "-v" ]] && [[ "$2" == "openclaw" ]]; then
+        return 1
+    fi
+
+    builtin command "$@"
+}
+
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+
+assert_eq "${_WAKE_CLI_AVAILABLE:-0}" "0" "transport-disabled: CLI not eagerly validated"
+if [[ -f "${_tmp_dir}/wake.log" ]]; then
+    log_content=$(cat "${_tmp_dir}/wake.log")
+    assert_not_contains "$log_content" "openclaw binary not found" \
+        "transport-disabled: no CLI-missing noise when wake disabled"
+fi
+
+# ── Transport: env override to gateway ─────────────────────────
+
+describe "Transport — APIARY_WAKE_TRANSPORT=gateway selects gateway"
+
+_setup
+export APIARY_WAKE_TRANSPORT="gateway"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+assert_eq "$_WAKE_TRANSPORT" "gateway" "transport-gw: env override works"
+
+# ── Transport: value is normalized to lowercase ────────────────
+
+describe "Transport — APIARY_WAKE_TRANSPORT normalization handles uppercase"
+
+_setup
+export APIARY_WAKE_TRANSPORT="CLI"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+assert_eq "$_WAKE_TRANSPORT" "cli" "transport-norm: uppercase normalized to cli"
+assert_eq "${_WAKE_TRANSPORT_INVALID:-0}" "0" "transport-norm: normalized value remains valid"
+
+# ── Transport: invalid value fails fast ────────────────────────
+
+describe "Transport — invalid APIARY_WAKE_TRANSPORT is rejected"
+
+_setup
+export APIARY_WAKE_TRANSPORT="clii"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+assert_eq "${_WAKE_TRANSPORT_INVALID:-0}" "1" "transport-invalid: invalid flag set"
+
+set +e
+_wake_send "sess-invalid" "test"
+rc=$?
+set -e
+assert_eq "$rc" "1" "transport-invalid: _wake_send fails fast"
+
+# ── Transport: _wake_send dispatches to CLI by default ─────────
+
+describe "Transport — _wake_send dispatches to CLI by default"
+
+_setup
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+_WAKE_TRANSPORT="cli"
+_CLI_DISPATCH_HIT=0
+_GW_DISPATCH_HIT=0
+
+_wake_send_cli() { _CLI_DISPATCH_HIT=1; return 0; }
+_wake_send_gateway() { _GW_DISPATCH_HIT=1; return 0; }
+
+_wake_send "sess-1" "test"
+assert_eq "$_CLI_DISPATCH_HIT" "1" "dispatch-cli: _wake_send_cli called"
+assert_eq "$_GW_DISPATCH_HIT" "0" "dispatch-cli: _wake_send_gateway NOT called"
+
+# ── Transport: _wake_send dispatches to gateway when configured ──
+
+describe "Transport — _wake_send dispatches to gateway when APIARY_WAKE_TRANSPORT=gateway"
+
+_setup
+export APIARY_WAKE_TRANSPORT="gateway"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+_CLI_DISPATCH_HIT=0
+_GW_DISPATCH_HIT=0
+
+_wake_send_cli() { _CLI_DISPATCH_HIT=1; return 0; }
+_wake_send_gateway() { _GW_DISPATCH_HIT=1; return 0; }
+
+_wake_send "sess-2" "test"
+assert_eq "$_GW_DISPATCH_HIT" "1" "dispatch-gw: _wake_send_gateway called"
+assert_eq "$_CLI_DISPATCH_HIT" "0" "dispatch-gw: _wake_send_cli NOT called"
+
+# ═══════════════════════════════════════════════════════════════
+# Gateway transport tests (opt-in fallback)
+# ═══════════════════════════════════════════════════════════════
+
+describe "Gateway transport — _wake_send_gateway constructs correct request"
+
+_setup
+export APIARY_WAKE_TRANSPORT="gateway"
 source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
 # Mock curl: writes captured args to files (survives command substitution subshell)
@@ -806,9 +1033,10 @@ assert_contains "$_body_message" "Hello gateway" "gateway-unit: payload message 
 
 # ── Gateway unit: HTTP error code ─────────────────────────────
 
-describe "Wake — _wake_send_gateway handles HTTP errors"
+describe "Gateway transport — handles HTTP errors"
 
 _setup
+export APIARY_WAKE_TRANSPORT="gateway"
 source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
 curl() {
@@ -825,9 +1053,10 @@ assert_ne "$rc" "0" "gateway-error: returns non-zero on HTTP 503"
 
 # ── Gateway unit: curl failure ────────────────────────────────
 
-describe "Wake — _wake_send_gateway handles curl failure"
+describe "Gateway transport — handles curl failure"
 
 _setup
+export APIARY_WAKE_TRANSPORT="gateway"
 source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
 curl() {
@@ -846,6 +1075,7 @@ assert_ne "$rc" "0" "gateway-curl-fail: returns non-zero when curl errors"
 describe "Alert gateway — _wake_send_alert_gateway constructs correct request"
 
 _setup
+export APIARY_WAKE_TRANSPORT="gateway"
 source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 
 _curl_capture_dir="${_tmp_dir}/curl_capture_alert"
@@ -909,7 +1139,7 @@ _alert_text=$(echo "$_captured_body" | jq -r '.args.text // "ABSENT"' 2>/dev/nul
 assert_eq "$_alert_text" "ABSENT" "alert-gw-unit: no legacy 'text' key in args"
 
 # ═══════════════════════════════════════════════════════════════
-# Dual-delivery (visible Telegram alert) tests
+# Dual-delivery (visible alert) tests
 # ═══════════════════════════════════════════════════════════════
 
 # Mock both _wake_send and _wake_send_alert to track dual-delivery calls.
@@ -1054,7 +1284,7 @@ _ALERT_INVOCATIONS=0
 # Mock _wake_send to fail, _wake_send_alert to succeed
 _wake_send() {
     _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
-    _wake_log "ERROR" "gateway returned HTTP 503 for session_send"
+    _wake_log "ERROR" "CLI transport failed for session_send"
     return 1
 }
 
@@ -1099,7 +1329,7 @@ source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 _WAKE_INVOCATIONS=0
 _ALERT_INVOCATIONS=0
 
-# Mock: both gateway transports fail
+# Mock: both transports fail
 _wake_send() {
     _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
     return 1
