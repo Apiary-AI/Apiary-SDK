@@ -119,11 +119,29 @@ _backoff_reset() {
 }
 
 _backoff_sleep() {
-    echo "[apiary-daemon] Network error, retrying in ${_backoff_delay}s..." >&2
+    echo "[apiary-daemon] Retrying in ${_backoff_delay}s..." >&2
     sleep "$_backoff_delay"
     _backoff_delay=$(( _backoff_delay * 2 ))
     if [[ $_backoff_delay -gt $_backoff_max ]]; then
         _backoff_delay=$_backoff_max
+    fi
+}
+
+# _rate_limit_sleep — sleep for retry-after duration on 429 responses.
+#   Uses _APIARY_RETRY_AFTER (set by SDK) when available, otherwise
+#   falls back to exponential backoff.
+_rate_limit_sleep() {
+    local retry_after="${_APIARY_RETRY_AFTER:-}"
+    if [[ -n "$retry_after" ]] && [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+        echo "[apiary-daemon] Rate-limited, retry-after ${retry_after}s" >&2
+        sleep "$retry_after"
+    else
+        echo "[apiary-daemon] Rate-limited, retrying in ${_backoff_delay}s..." >&2
+        sleep "$_backoff_delay"
+        _backoff_delay=$(( _backoff_delay * 2 ))
+        if [[ $_backoff_delay -gt $_backoff_max ]]; then
+            _backoff_delay=$_backoff_max
+        fi
     fi
 }
 
@@ -274,34 +292,47 @@ main() {
     echo "[apiary-daemon] Online and polling." >&2
 
     while true; do
-        local now
+        local now _skip_poll_sleep=0
         now=$(date +%s)
 
-        # Heartbeat
+        # Heartbeat — classify failure explicitly to avoid auth-reset loops
         if (( now - last_heartbeat >= HEARTBEAT_INTERVAL )); then
-            if apiary_heartbeat >/dev/null 2>&1; then
+            local hb_rc=0
+            apiary_heartbeat >/dev/null 2>&1 || hb_rc=$?
+
+            if [[ "$hb_rc" -eq 0 ]]; then
                 _backoff_reset
                 last_heartbeat=$now
-            else
-                # Check if auth expired
-                if ! apiary_me >/dev/null 2>&1; then
-                    echo "[apiary-daemon] Auth expired, re-authenticating..." >&2
-                    if ! apiary_oc_ensure_auth >/dev/null 2>&1; then
-                        _backoff_sleep
-                        continue
-                    fi
-                else
+            elif [[ "$hb_rc" -eq "$APIARY_ERR_RATE_LIMIT" ]]; then
+                echo "[apiary-daemon] Heartbeat rate-limited (429)" >&2
+                _stats_errors=$(( _stats_errors + 1 ))
+                _rate_limit_sleep
+                continue
+            elif [[ "$hb_rc" -eq "$APIARY_ERR_AUTH" ]]; then
+                echo "[apiary-daemon] Heartbeat auth failed (401), re-authenticating..." >&2
+                if ! apiary_oc_ensure_auth >/dev/null 2>&1; then
+                    echo "[apiary-daemon] Re-authentication failed" >&2
                     _backoff_sleep
                     continue
                 fi
+                # Do NOT advance last_heartbeat here — re-auth succeeded but
+                # the heartbeat itself was never delivered.  Leave the timer
+                # so the next iteration immediately retries the heartbeat.
+            else
+                echo "[apiary-daemon] Heartbeat failed (rc=${hb_rc}), transient error" >&2
+                _stats_errors=$(( _stats_errors + 1 ))
+                _backoff_sleep
+                continue
             fi
         fi
 
         # Poll for tasks
         local hive_id="${APIARY_HIVE_ID:-}"
         if [[ -n "$hive_id" ]]; then
-            local tasks
-            if tasks=$(apiary_poll_tasks "$hive_id" -l "$POLL_MAX_TASKS" 2>/dev/null); then
+            local tasks poll_rc=0
+            tasks=$(apiary_poll_tasks "$hive_id" -l "$POLL_MAX_TASKS" 2>/dev/null) || poll_rc=$?
+
+            if [[ "$poll_rc" -eq 0 ]]; then
                 _backoff_reset
                 _stats_poll_cycles=$(( _stats_poll_cycles + 1 ))
                 _stats_last_poll_time=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)
@@ -340,7 +371,17 @@ main() {
                         fi
                     done
                 fi
+            elif [[ "$poll_rc" -eq "$APIARY_ERR_RATE_LIMIT" ]]; then
+                echo "[apiary-daemon] Task poll rate-limited (429)" >&2
+                _stats_errors=$(( _stats_errors + 1 ))
+                _rate_limit_sleep
+                _skip_poll_sleep=1
+            elif [[ "$poll_rc" -eq "$APIARY_ERR_AUTH" ]]; then
+                echo "[apiary-daemon] Task poll auth failed (401), re-authenticating..." >&2
+                _stats_errors=$(( _stats_errors + 1 ))
+                apiary_oc_ensure_auth >/dev/null 2>&1 || true
             else
+                echo "[apiary-daemon] Task poll failed (rc=${poll_rc})" >&2
                 _stats_errors=$(( _stats_errors + 1 ))
             fi
 
@@ -356,7 +397,10 @@ main() {
             _daemon_write_stats 2>/dev/null || true
         fi
 
-        sleep "$POLL_INTERVAL"
+        # Skip loop-tail sleep if _rate_limit_sleep already waited
+        if [[ "$_skip_poll_sleep" -eq 0 ]]; then
+            sleep "$POLL_INTERVAL"
+        fi
     done
 }
 
