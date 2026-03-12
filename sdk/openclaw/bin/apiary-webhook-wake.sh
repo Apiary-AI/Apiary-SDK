@@ -2,11 +2,17 @@
 # apiary-webhook-wake.sh — Bridge: wake OpenClaw session on actionable webhook tasks.
 #
 # When the daemon detects a new pending webhook_handler task, this module
-# parses PR comment metadata from the event payload and invokes
-# `openclaw session send` (or legacy `sessions_send`) to auto-wake the assistant.
+# parses PR comment metadata from the event payload and POSTs to the
+# OpenClaw gateway HTTP API to auto-wake the assistant with actionable context.
+#
+# Transport: gateway HTTP only.  The OpenClaw CLI does not expose a
+# session-send subcommand in the current runtime, so the bridge uses
+# direct HTTP POST to the gateway /tools/invoke endpoint exclusively.
+# If the gateway is unreachable the bridge fails fast with diagnostics.
 #
 # Features:
 #   - Idempotent: tracks seen task+comment IDs to prevent duplicate wakeups
+#   - Fail-fast: gateway connectivity validated at init; errors surface immediately
 #   - Fail-soft: parsing/invoke failures are logged but never crash the daemon
 #   - Configurable: enable/disable, session target, log path, debounce
 #
@@ -17,7 +23,7 @@
 #   APIARY_WAKE_DEBOUNCE_SECS   — Min seconds between wakes for same comment (default: 5)
 #   APIARY_CONFIG_DIR            — Config directory (default: ~/.config/apiary)
 #
-# Fallback transport (when openclaw CLI is not in PATH):
+# Gateway transport (canonical wake path):
 #   APIARY_WAKE_GATEWAY_URL      — OpenClaw gateway base URL (default: http://localhost:3223)
 #   APIARY_WAKE_GATEWAY_TOKEN    — Bearer token for gateway auth (optional)
 #   APIARY_WAKE_GATEWAY_TIMEOUT  — HTTP timeout in seconds (default: 5)
@@ -244,15 +250,14 @@ _wake_parse_pr_comment() {
 
 # ── Wake invocation ────────────────────────────────────────────
 
-# Fallback: POST directly to the OpenClaw local gateway HTTP API.
+# POST directly to the OpenClaw local gateway HTTP API.
 # Endpoint: POST {gateway}/tools/invoke  body: {"tool":"session_send","args":{"sessionKey":"...","message":"..."}}
-# Tries current tool name (session_send), then legacy (sessions_send).
 _wake_send_gateway() {
     local session_id="$1"
     local message="$2"
 
     if ! command -v curl >/dev/null 2>&1; then
-        _wake_log "WARN" "curl not found; gateway fallback unavailable"
+        _wake_log "ERROR" "curl not found; wake gateway unavailable — install curl to enable wake"
         return 1
     fi
 
@@ -269,105 +274,46 @@ _wake_send_gateway() {
         curl_args+=(-H "Authorization: Bearer ${_WAKE_GATEWAY_TOKEN}")
     fi
 
-    # Try current tool name first, then legacy
-    local tool_name
-    for tool_name in "session_send" "sessions_send"; do
-        local body
-        body=$(jq -n --arg tool "$tool_name" --arg key "$session_id" --arg msg "$message" \
-            '{"tool":$tool,"args":{"sessionKey":$key,"message":$msg}}' 2>/dev/null) || \
-            body="{\"tool\":\"${tool_name}\",\"args\":{\"sessionKey\":\"${session_id}\",\"message\":\"wake\"}}"
+    local body
+    body=$(jq -n --arg key "$session_id" --arg msg "$message" \
+        '{"tool":"session_send","args":{"sessionKey":$key,"message":$msg}}' 2>/dev/null) || \
+        body="{\"tool\":\"session_send\",\"args\":{\"sessionKey\":\"${session_id}\",\"message\":\"wake\"}}"
 
-        local http_code
-        http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
-            _wake_log "WARN" "gateway request failed (curl error) url=${url}"
-            return 1
-        }
-
-        if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
-            if [[ "$tool_name" == "sessions_send" ]]; then
-                _wake_log "INFO" "gateway: current session_send unavailable; legacy sessions_send succeeded"
-            fi
-            return 0
-        fi
-
-        # 404/422 might mean tool name not recognized — try legacy
-        if [[ "$tool_name" == "session_send" ]] && [[ "$http_code" -ge 400 ]] && [[ "$http_code" -lt 500 ]]; then
-            _wake_log "INFO" "gateway: session_send returned HTTP ${http_code}; trying legacy sessions_send"
-            continue
-        fi
-
-        _wake_log "WARN" "gateway returned HTTP ${http_code} for ${url} (tool=${tool_name})"
+    local http_code
+    http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
+        _wake_log "ERROR" "gateway request failed (curl error) url=${url}"
         return 1
-    done
+    }
 
-    _wake_log "WARN" "gateway: both tool names failed for ${url}"
+    if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
+        return 0
+    fi
+
+    _wake_log "ERROR" "gateway returned HTTP ${http_code} for session_send at ${url}"
     return 1
 }
 
-# Invoke openclaw session send to wake the target session.
-# Tries current CLI command, then legacy variant, then gateway HTTP fallback.
+# Send a wake message to the target session via gateway HTTP.
+# This is the canonical (and only) wake path for the current OpenClaw runtime.
+# The CLI does not support session send subcommands (sessions_send, session send
+# are all invalid in this version).  Fail fast with diagnostics.
 _wake_send() {
     local session_id="$1"
     local message="$2"
 
-    # Primary: try openclaw CLI (current then legacy command)
-    if command -v openclaw >/dev/null 2>&1; then
-        # Current CLI: space-separated subcommand (openclaw >= 2025)
-        if openclaw session send --session "$session_id" --text "$message" 2>/dev/null; then
-            return 0
-        fi
-        # Legacy CLI: underscore variant (openclaw < 2025)
-        if openclaw sessions_send --session "$session_id" --text "$message" 2>/dev/null; then
-            _wake_log "INFO" "openclaw session send unavailable; legacy sessions_send succeeded"
-            return 0
-        fi
-        _wake_log "WARN" "openclaw session send failed (tried both variants); trying gateway fallback"
-    else
-        _wake_log "INFO" "openclaw CLI not found; using gateway fallback"
-    fi
-
-    # Fallback: direct HTTP to local gateway
     _wake_send_gateway "$session_id" "$message"
 }
 
 # ── Visible alert (Telegram) ──────────────────────────────────
 
-# Send a short user-visible alert via openclaw message send (Telegram).
-# Tries current CLI command, then legacy variant, then gateway HTTP fallback.
-# Returns 0 on success, 1 on failure (caller should treat as non-fatal).
-_wake_send_alert() {
-    local target="$1"
-    local channel="$2"
-    local message="$3"
-
-    # Primary: try openclaw CLI (current then legacy command)
-    if command -v openclaw >/dev/null 2>&1; then
-        # Current CLI: space-separated subcommand (openclaw >= 2025)
-        if openclaw message send --channel "$channel" --target "$target" --text "$message" 2>/dev/null; then
-            return 0
-        fi
-        # Legacy CLI: dot-separated variant (openclaw < 2025)
-        if openclaw message.send --channel "$channel" --target "$target" --text "$message" 2>/dev/null; then
-            _wake_log "INFO" "openclaw message send unavailable; legacy message.send succeeded"
-            return 0
-        fi
-        _wake_log "WARN" "openclaw message send failed (tried both variants); trying gateway fallback for alert"
-    else
-        _wake_log "INFO" "openclaw CLI not found; using gateway fallback for alert"
-    fi
-
-    # Fallback: direct HTTP to local gateway
-    _wake_send_alert_gateway "$target" "$channel" "$message"
-}
-
-# Fallback: POST alert via gateway /tools/invoke with message tool (action=send).
+# POST alert via gateway /tools/invoke with message tool (action=send).
 _wake_send_alert_gateway() {
     local target="$1"
     local channel="$2"
     local message="$3"
 
     if ! command -v curl >/dev/null 2>&1; then
-        _wake_log "WARN" "curl not found; alert gateway fallback unavailable"
+        _wake_log "ERROR" "curl not found; alert gateway unavailable — install curl to enable alerts"
         return 1
     fi
 
@@ -391,7 +337,7 @@ _wake_send_alert_gateway() {
 
     local http_code
     http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
-        _wake_log "WARN" "alert gateway request failed (curl error) url=${url}"
+        _wake_log "ERROR" "alert gateway request failed (curl error) url=${url}"
         return 1
     }
 
@@ -399,8 +345,18 @@ _wake_send_alert_gateway() {
         return 0
     fi
 
-    _wake_log "WARN" "alert gateway returned HTTP ${http_code} for ${url}"
+    _wake_log "ERROR" "alert gateway returned HTTP ${http_code} for ${url}"
     return 1
+}
+
+# Send a visible alert via gateway HTTP.
+# Returns 0 on success, 1 on failure (caller should treat as non-fatal).
+_wake_send_alert() {
+    local target="$1"
+    local channel="$2"
+    local message="$3"
+
+    _wake_send_alert_gateway "$target" "$channel" "$message"
 }
 
 # ── Main entry point ──────────────────────────────────────────

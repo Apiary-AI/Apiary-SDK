@@ -115,14 +115,10 @@ _setup() {
         return 0
     }
 
-    # Mock openclaw CLI — responds to current `session send` command
-    openclaw() {
-        if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
-            return 0
-        fi
+    # Mock wake transport (gateway-only in current runtime)
+    _wake_send() {
         return 0
     }
-    export -f openclaw 2>/dev/null || true
 }
 
 # Build a realistic PR comment webhook task
@@ -342,8 +338,6 @@ apiary_fail_task() {
 
 # Mock wake delivery to FAIL
 _wake_send() { return 1; }
-openclaw() { return 1; }
-export -f openclaw 2>/dev/null || true
 
 task_json=$(_make_pr_comment_task "lc-fail" 200 "org/fail-repo" 20 "Will fail delivery")
 echo "$task_json" > "${PENDING_DIR}/lc-fail.json"
@@ -912,8 +906,6 @@ apiary_fail_task() {
     return 1  # simulate API failure
 }
 _wake_send() { return 1; }
-openclaw() { return 1; }
-export -f openclaw 2>/dev/null || true
 
 set +e
 _lifecycle_process_webhook_handler "$task_json" "lc-fail-fail"
@@ -1626,8 +1618,6 @@ apiary_fail_task() {
 }
 # Mock wake delivery to FAIL
 _wake_send() { return 1; }
-openclaw() { return 1; }
-export -f openclaw 2>/dev/null || true
 
 task_json=$(_make_pr_comment_task "wm-fail" 10004 "org/wm" 104 "Wake metric fail")
 echo "$task_json" > "${PENDING_DIR}/wm-fail.json"
@@ -1830,8 +1820,6 @@ apiary_fail_task() {
     return 0
 }
 _wake_send() { return 1; }
-openclaw() { return 1; }
-export -f openclaw 2>/dev/null || true
 
 task_json=$(_make_pr_comment_task "p1-delfail" 20002 "org/p1" 202 "Delivery will fail")
 echo "$task_json" > "${PENDING_DIR}/p1-delfail.json"
