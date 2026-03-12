@@ -215,14 +215,14 @@ When `APIARY_WAKE_ENABLED=true`, the daemon automatically wakes an OpenClaw assi
 1. Parses PR comment metadata from the webhook payload (repo, PR number, comment URL, body)
 2. Extracts severity hints from the comment body (`[urgent]`, `[critical]`, `[high]`, `[low]`)
 3. Deduplicates using task ID + comment ID (prevents repeat wakes within the debounce window)
-4. Invokes `openclaw sessions_send` to wake the target session with actionable context
+4. Invokes `openclaw session send` (or legacy `sessions_send`) to wake the target session with actionable context
 5. Falls back to direct HTTP POST to the OpenClaw gateway when the CLI is not in PATH
 
 All parsing and invocation failures are logged but never crash the daemon loop (fail-soft).
 
 #### Dual-Delivery (Visible Telegram Alert)
 
-When `APIARY_WAKE_ALERT_ENABLED=true`, the bridge sends **both** an internal wake (via `sessions_send`) and a user-visible Telegram alert (via `message.send`) for each actionable PR comment event. This ensures assistant automation is triggered while also notifying users in their Telegram chat.
+When `APIARY_WAKE_ALERT_ENABLED=true`, the bridge sends **both** an internal wake (via `session send`) and a user-visible Telegram alert (via `message send`) for each actionable PR comment event. This ensures assistant automation is triggered while also notifying users in their Telegram chat.
 
 - Dedupe applies to both: a single event produces at most one internal wake **and** one visible alert
 - If the visible alert fails, the daemon logs a warning but does not crash; the internal wake still proceeds
@@ -232,7 +232,7 @@ When `APIARY_WAKE_ALERT_ENABLED=true`, the bridge sends **both** an internal wak
 
 When the `openclaw` binary is not available in `$PATH`, the bridge automatically falls back to a direct HTTP POST to the OpenClaw local gateway's `/tools/invoke` endpoint:
 
-- **Wake**: `POST {gateway}/tools/invoke` with `{"tool":"sessions_send","args":{"sessionKey":"...","message":"..."}}`
+- **Wake**: `POST {gateway}/tools/invoke` with `{"tool":"session_send","args":{"sessionKey":"...","message":"..."}}` (falls back to legacy `sessions_send` tool name)
 - **Alert**: `POST {gateway}/tools/invoke` with `{"tool":"message","args":{"action":"send","channel":"...","target":"...","message":"..."}}`
 
 Configure `APIARY_WAKE_GATEWAY_URL` if the gateway runs on a non-default address. Set `APIARY_WAKE_GATEWAY_TOKEN` if gateway auth is required.

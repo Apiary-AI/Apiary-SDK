@@ -3,7 +3,7 @@
 #
 # When the daemon detects a new pending webhook_handler task, this module
 # parses PR comment metadata from the event payload and invokes
-# `openclaw sessions_send` to auto-wake the assistant with actionable context.
+# `openclaw session send` (or legacy `sessions_send`) to auto-wake the assistant.
 #
 # Features:
 #   - Idempotent: tracks seen task+comment IDs to prevent duplicate wakeups
@@ -245,7 +245,8 @@ _wake_parse_pr_comment() {
 # ── Wake invocation ────────────────────────────────────────────
 
 # Fallback: POST directly to the OpenClaw local gateway HTTP API.
-# Endpoint: POST {gateway}/tools/invoke  body: {"tool":"sessions_send","args":{"sessionKey":"...","message":"..."}}
+# Endpoint: POST {gateway}/tools/invoke  body: {"tool":"session_send","args":{"sessionKey":"...","message":"..."}}
+# Tries current tool name (session_send), then legacy (sessions_send).
 _wake_send_gateway() {
     local session_id="$1"
     local message="$2"
@@ -268,37 +269,59 @@ _wake_send_gateway() {
         curl_args+=(-H "Authorization: Bearer ${_WAKE_GATEWAY_TOKEN}")
     fi
 
-    local body
-    body=$(jq -n --arg key "$session_id" --arg msg "$message" \
-        '{"tool":"sessions_send","args":{"sessionKey":$key,"message":$msg}}' 2>/dev/null) || \
-        body="{\"tool\":\"sessions_send\",\"args\":{\"sessionKey\":\"${session_id}\",\"message\":\"wake\"}}"
+    # Try current tool name first, then legacy
+    local tool_name
+    for tool_name in "session_send" "sessions_send"; do
+        local body
+        body=$(jq -n --arg tool "$tool_name" --arg key "$session_id" --arg msg "$message" \
+            '{"tool":$tool,"args":{"sessionKey":$key,"message":$msg}}' 2>/dev/null) || \
+            body="{\"tool\":\"${tool_name}\",\"args\":{\"sessionKey\":\"${session_id}\",\"message\":\"wake\"}}"
 
-    local http_code
-    http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
-        _wake_log "WARN" "gateway request failed (curl error) url=${url}"
+        local http_code
+        http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
+            _wake_log "WARN" "gateway request failed (curl error) url=${url}"
+            return 1
+        }
+
+        if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
+            if [[ "$tool_name" == "sessions_send" ]]; then
+                _wake_log "INFO" "gateway: current session_send unavailable; legacy sessions_send succeeded"
+            fi
+            return 0
+        fi
+
+        # 404/422 might mean tool name not recognized — try legacy
+        if [[ "$tool_name" == "session_send" ]] && [[ "$http_code" -ge 400 ]] && [[ "$http_code" -lt 500 ]]; then
+            _wake_log "INFO" "gateway: session_send returned HTTP ${http_code}; trying legacy sessions_send"
+            continue
+        fi
+
+        _wake_log "WARN" "gateway returned HTTP ${http_code} for ${url} (tool=${tool_name})"
         return 1
-    }
+    done
 
-    if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
-        return 0
-    fi
-
-    _wake_log "WARN" "gateway returned HTTP ${http_code} for ${url}"
+    _wake_log "WARN" "gateway: both tool names failed for ${url}"
     return 1
 }
 
-# Invoke openclaw sessions_send to wake the target session.
-# Falls back to direct gateway HTTP POST when the CLI is unavailable.
+# Invoke openclaw session send to wake the target session.
+# Tries current CLI command, then legacy variant, then gateway HTTP fallback.
 _wake_send() {
     local session_id="$1"
     local message="$2"
 
-    # Primary: try openclaw CLI
+    # Primary: try openclaw CLI (current then legacy command)
     if command -v openclaw >/dev/null 2>&1; then
-        if openclaw sessions_send --session "$session_id" --text "$message" 2>/dev/null; then
+        # Current CLI: space-separated subcommand (openclaw >= 2025)
+        if openclaw session send --session "$session_id" --text "$message" 2>/dev/null; then
             return 0
         fi
-        _wake_log "WARN" "openclaw sessions_send failed; trying gateway fallback"
+        # Legacy CLI: underscore variant (openclaw < 2025)
+        if openclaw sessions_send --session "$session_id" --text "$message" 2>/dev/null; then
+            _wake_log "INFO" "openclaw session send unavailable; legacy sessions_send succeeded"
+            return 0
+        fi
+        _wake_log "WARN" "openclaw session send failed (tried both variants); trying gateway fallback"
     else
         _wake_log "INFO" "openclaw CLI not found; using gateway fallback"
     fi
@@ -309,19 +332,26 @@ _wake_send() {
 
 # ── Visible alert (Telegram) ──────────────────────────────────
 
-# Send a short user-visible alert via openclaw message.send (Telegram).
+# Send a short user-visible alert via openclaw message send (Telegram).
+# Tries current CLI command, then legacy variant, then gateway HTTP fallback.
 # Returns 0 on success, 1 on failure (caller should treat as non-fatal).
 _wake_send_alert() {
     local target="$1"
     local channel="$2"
     local message="$3"
 
-    # Primary: try openclaw CLI message.send
+    # Primary: try openclaw CLI (current then legacy command)
     if command -v openclaw >/dev/null 2>&1; then
-        if openclaw message.send --channel "$channel" --target "$target" --text "$message" 2>/dev/null; then
+        # Current CLI: space-separated subcommand (openclaw >= 2025)
+        if openclaw message send --channel "$channel" --target "$target" --text "$message" 2>/dev/null; then
             return 0
         fi
-        _wake_log "WARN" "openclaw message.send failed; trying gateway fallback for alert"
+        # Legacy CLI: dot-separated variant (openclaw < 2025)
+        if openclaw message.send --channel "$channel" --target "$target" --text "$message" 2>/dev/null; then
+            _wake_log "INFO" "openclaw message send unavailable; legacy message.send succeeded"
+            return 0
+        fi
+        _wake_log "WARN" "openclaw message send failed (tried both variants); trying gateway fallback for alert"
     else
         _wake_log "INFO" "openclaw CLI not found; using gateway fallback for alert"
     fi

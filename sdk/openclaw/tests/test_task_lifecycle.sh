@@ -115,9 +115,9 @@ _setup() {
         return 0
     }
 
-    # Mock openclaw CLI
+    # Mock openclaw CLI — responds to current `session send` command
     openclaw() {
-        if [[ "${1:-}" == "sessions_send" ]]; then
+        if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
             return 0
         fi
         return 0

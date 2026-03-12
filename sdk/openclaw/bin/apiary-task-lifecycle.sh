@@ -571,7 +571,7 @@ _lifecycle_parse_reminder_payload() {
 # Steps:
 #   1. Claim task atomically (409 = another agent got it → skip)
 #   2. Parse + validate channel/target/message
-#   3. Deliver via openclaw message.send bridge (_wake_send_alert)
+#   3. Deliver via openclaw message send bridge (_wake_send_alert)
 #   4. Complete or fail the task in Apiary
 #   5. Write a local trace record
 #   6. Remove from pending directory
@@ -763,7 +763,7 @@ _lifecycle_process_reminder() {
                 _wake_log "INFO" "lifecycle: reminder delivered for ${task_id} via channel=${channel} target=${target}"
             else
                 process_status="failed"
-                process_summary="delivery failed: message.send channel=${channel} target=${target}"
+                process_summary="delivery failed: message send channel=${channel} target=${target}"
                 _wake_log "WARN" "lifecycle: reminder delivery failed for ${task_id} via channel=${channel} target=${target}"
             fi
         fi

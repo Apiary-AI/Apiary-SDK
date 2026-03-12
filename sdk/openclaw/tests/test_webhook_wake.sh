@@ -40,10 +40,10 @@ _setup() {
     source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 }
 
-# Mock openclaw CLI
+# Mock openclaw CLI — responds to current `session send` command
 openclaw() {
-    if [[ "${1:-}" == "sessions_send" ]]; then
-        shift
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
@@ -506,7 +506,7 @@ assert_ne "$seen" "0" "expired entry is not seen (debounce=0)"
 # Wake invocation tests
 # ═══════════════════════════════════════════════════════════════
 
-describe "Wake — invokes openclaw sessions_send"
+describe "Wake — invokes openclaw session send"
 
 _setup
 _WAKE_INVOCATIONS=0
@@ -672,7 +672,7 @@ task_json=$(_make_pr_comment_task "wake-primary" 400 "org/primary" 10 "Primary p
 # The mock `openclaw` function defined above is in scope → primary path
 apiary_webhook_wake "$task_json" "wake-primary"
 
-assert_eq "$_WAKE_INVOCATIONS" "1" "primary: openclaw sessions_send invoked"
+assert_eq "$_WAKE_INVOCATIONS" "1" "primary: openclaw session send invoked"
 assert_eq "$_WAKE_LAST_SESSION" "test-session-123" "primary: correct session"
 assert_contains "$_WAKE_LAST_MESSAGE" "org/primary" "primary: message includes repo"
 
@@ -801,11 +801,11 @@ assert_contains "$_captured_url" "test-gw:9999" "gateway-unit: uses configured g
 assert_contains "$_captured_url" "/tools/invoke" "gateway-unit: correct endpoint path"
 assert_contains "$_captured_auth" "Bearer test-token-abc" "gateway-unit: sends bearer token"
 
-# Validate exact payload shape: {"tool":"sessions_send","args":{"sessionKey":"...","message":"..."}}
+# Validate exact payload shape: {"tool":"session_send","args":{"sessionKey":"...","message":"..."}}
 _body_tool=$(echo "$_captured_body" | jq -r '.tool' 2>/dev/null)
 _body_session_key=$(echo "$_captured_body" | jq -r '.args.sessionKey' 2>/dev/null)
 _body_message=$(echo "$_captured_body" | jq -r '.args.message' 2>/dev/null)
-assert_eq "$_body_tool" "sessions_send" "gateway-unit: payload tool is sessions_send"
+assert_eq "$_body_tool" "session_send" "gateway-unit: payload tool is session_send"
 assert_eq "$_body_session_key" "sess-42" "gateway-unit: payload sessionKey matches session id"
 assert_contains "$_body_message" "Hello gateway" "gateway-unit: payload message contains text"
 
@@ -917,7 +917,7 @@ assert_eq "$_alert_text" "ABSENT" "alert-gw-unit: no legacy 'text' key in args"
 # Dual-delivery (visible Telegram alert) tests
 # ═══════════════════════════════════════════════════════════════
 
-# Mock openclaw to track both sessions_send and message.send calls
+# Mock openclaw to track both session send and message send calls
 _setup_dual_mocks() {
     _WAKE_INVOCATIONS=0
     _WAKE_LAST_MESSAGE=""
@@ -928,8 +928,8 @@ _setup_dual_mocks() {
     _ALERT_LAST_MESSAGE=""
 
     openclaw() {
-        if [[ "${1:-}" == "sessions_send" ]]; then
-            shift
+        if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+            shift 2
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
@@ -939,8 +939,8 @@ _setup_dual_mocks() {
             done
             _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
             return 0
-        elif [[ "${1:-}" == "message.send" ]]; then
-            shift
+        elif [[ "${1:-}" == "message" ]] && [[ "${2:-}" == "send" ]]; then
+            shift 2
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --channel) _ALERT_LAST_CHANNEL="$2"; shift 2 ;;
@@ -1026,10 +1026,10 @@ source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 _WAKE_INVOCATIONS=0
 _ALERT_INVOCATIONS=0
 
-# Mock: sessions_send succeeds, message.send fails
+# Mock: session send succeeds, message send fails
 openclaw() {
-    if [[ "${1:-}" == "sessions_send" ]]; then
-        shift
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
@@ -1039,9 +1039,12 @@ openclaw() {
         done
         _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
         return 0
-    elif [[ "${1:-}" == "message.send" ]]; then
+    elif [[ "${1:-}" == "message" ]] && [[ "${2:-}" == "send" ]]; then
         _ALERT_INVOCATIONS=$((_ALERT_INVOCATIONS + 1))
         return 1  # simulate failure
+    elif [[ "${1:-}" == "message.send" ]]; then
+        _ALERT_INVOCATIONS=$((_ALERT_INVOCATIONS + 1))
+        return 1  # legacy variant also fails
     fi
     return 0
 }
@@ -1081,13 +1084,16 @@ source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 _WAKE_INVOCATIONS=0
 _ALERT_INVOCATIONS=0
 
-# Mock: sessions_send FAILS, message.send SUCCEEDS
+# Mock: session send FAILS, message send SUCCEEDS
 openclaw() {
-    if [[ "${1:-}" == "sessions_send" ]]; then
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
         _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
-        return 1  # simulate wake failure
-    elif [[ "${1:-}" == "message.send" ]]; then
-        shift
+        return 1  # simulate wake failure (current command)
+    elif [[ "${1:-}" == "sessions_send" ]]; then
+        _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
+        return 1  # legacy variant also fails
+    elif [[ "${1:-}" == "message" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 --channel) _ALERT_LAST_CHANNEL="$2"; shift 2 ;;
@@ -1138,14 +1144,18 @@ source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
 _WAKE_INVOCATIONS=0
 _ALERT_INVOCATIONS=0
 
-# Mock: both transports fail
+# Mock: both transports fail (current and legacy variants)
 openclaw() {
-    if [[ "${1:-}" == "sessions_send" ]]; then
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
         _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
         return 1
-    elif [[ "${1:-}" == "message.send" ]]; then
+    elif [[ "${1:-}" == "sessions_send" ]]; then
+        return 1  # legacy wake also fails
+    elif [[ "${1:-}" == "message" ]] && [[ "${2:-}" == "send" ]]; then
         _ALERT_INVOCATIONS=$((_ALERT_INVOCATIONS + 1))
         return 1
+    elif [[ "${1:-}" == "message.send" ]]; then
+        return 1  # legacy alert also fails
     fi
     return 0
 }
@@ -1204,6 +1214,184 @@ task_json=$(_make_pr_comment_task "dual-t6" 605 "org/icon" 25 "[high] Needs atte
 apiary_webhook_wake "$task_json" "dual-t6"
 assert_contains "$_ALERT_LAST_MESSAGE" "high" "icon: high severity in alert"
 
+
+# ═══════════════════════════════════════════════════════════════
+# CLI command selection / fallback tests
+# ═══════════════════════════════════════════════════════════════
+
+describe "CLI fallback — new command fails, legacy sessions_send succeeds"
+
+_setup
+rm -f "${_tmp_dir}/wake_seen.json"
+_WAKE_INVOCATIONS=0
+_WAKE_LAST_SESSION=""
+_WAKE_LAST_MESSAGE=""
+
+# Mock: `session send` fails (unknown subcommand), `sessions_send` succeeds
+openclaw() {
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        return 1  # current command unavailable
+    elif [[ "${1:-}" == "sessions_send" ]]; then
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
+                --text) _WAKE_LAST_MESSAGE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
+        return 0
+    fi
+    return 0
+}
+export -f openclaw 2>/dev/null || true
+
+task_json=$(_make_pr_comment_task "cli-fb1" 900 "org/legacy-cli" 50 "Legacy CLI test")
+apiary_webhook_wake "$task_json" "cli-fb1"
+
+assert_eq "$_WAKE_INVOCATIONS" "1" "cli-fallback: legacy sessions_send invoked"
+assert_eq "$_WAKE_LAST_SESSION" "test-session-123" "cli-fallback: correct session"
+assert_contains "$_WAKE_LAST_MESSAGE" "org/legacy-cli" "cli-fallback: message includes repo"
+
+# Verify log mentions legacy fallback
+if [[ -f "${_tmp_dir}/wake.log" ]]; then
+    log_content=$(cat "${_tmp_dir}/wake.log")
+    assert_contains "$log_content" "legacy sessions_send succeeded" "cli-fallback: log notes legacy path"
+fi
+
+# ── CLI fallback: new command succeeds, legacy never tried ──────
+
+describe "CLI fallback — new command succeeds, legacy never called"
+
+_setup
+rm -f "${_tmp_dir}/wake_seen.json"
+_WAKE_INVOCATIONS=0
+_LEGACY_INVOCATIONS=0
+
+# Mock: `session send` succeeds; track if legacy is called
+openclaw() {
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
+                --text) _WAKE_LAST_MESSAGE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
+        return 0
+    elif [[ "${1:-}" == "sessions_send" ]]; then
+        _LEGACY_INVOCATIONS=$((_LEGACY_INVOCATIONS + 1))
+        return 0
+    fi
+    return 0
+}
+export -f openclaw 2>/dev/null || true
+
+task_json=$(_make_pr_comment_task "cli-new1" 901 "org/new-cli" 51 "New CLI test")
+apiary_webhook_wake "$task_json" "cli-new1"
+
+assert_eq "$_WAKE_INVOCATIONS" "1" "cli-new: current session send invoked"
+assert_eq "$_LEGACY_INVOCATIONS" "0" "cli-new: legacy sessions_send NOT called"
+
+# ── CLI fallback: both fail, falls through to gateway ──────────
+
+describe "CLI fallback — both CLI variants fail, gateway used"
+
+_setup
+rm -f "${_tmp_dir}/wake_seen.json"
+rm -f "${_tmp_dir}/wake.log"
+_WAKE_INVOCATIONS=0
+_GATEWAY_INVOCATIONS=0
+
+# Mock: both CLI commands fail
+openclaw() {
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        return 1
+    elif [[ "${1:-}" == "sessions_send" ]]; then
+        return 1
+    fi
+    return 0
+}
+export -f openclaw 2>/dev/null || true
+
+# Re-source to get real _wake_send with our mocked openclaw
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+
+# Override _wake_send_gateway AFTER re-source so it is not overwritten
+_wake_send_gateway() {
+    _GATEWAY_INVOCATIONS=$((_GATEWAY_INVOCATIONS + 1))
+    return 0
+}
+
+task_json=$(_make_pr_comment_task "cli-gw1" 902 "org/gateway-cli" 52 "Gateway fallback test")
+apiary_webhook_wake "$task_json" "cli-gw1"
+
+assert_eq "$_GATEWAY_INVOCATIONS" "1" "cli-gateway: gateway fallback invoked after both CLI variants fail"
+
+if [[ -f "${_tmp_dir}/wake.log" ]]; then
+    log_content=$(cat "${_tmp_dir}/wake.log")
+    assert_contains "$log_content" "tried both variants" "cli-gateway: log mentions both variants tried"
+fi
+
+# ── Alert CLI fallback: new message send fails, legacy message.send succeeds ─
+
+describe "Alert CLI fallback — new command fails, legacy message.send succeeds"
+
+_setup
+rm -f "${_tmp_dir}/wake_seen.json"
+export APIARY_WAKE_ALERT_ENABLED="true"
+export APIARY_WAKE_ALERT_TELEGRAM="@fb-user"
+export APIARY_WAKE_ALERT_CHANNEL="telegram"
+source "${SCRIPT_DIR}/../bin/apiary-webhook-wake.sh"
+_WAKE_INVOCATIONS=0
+_ALERT_INVOCATIONS=0
+_ALERT_LAST_MESSAGE=""
+
+# Mock: session send works, message send fails but message.send works
+openclaw() {
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --session) shift 2 ;;
+                --text) shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
+        return 0
+    elif [[ "${1:-}" == "message" ]] && [[ "${2:-}" == "send" ]]; then
+        return 1  # current alert command unavailable
+    elif [[ "${1:-}" == "message.send" ]]; then
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --channel) shift 2 ;;
+                --target) shift 2 ;;
+                --text) _ALERT_LAST_MESSAGE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        _ALERT_INVOCATIONS=$((_ALERT_INVOCATIONS + 1))
+        return 0
+    fi
+    return 0
+}
+export -f openclaw 2>/dev/null || true
+
+task_json=$(_make_pr_comment_task "alert-fb1" 903 "org/alert-legacy" 53 "Alert legacy test")
+apiary_webhook_wake "$task_json" "alert-fb1"
+
+assert_eq "$_WAKE_INVOCATIONS" "1" "alert-cli-fb: wake succeeded"
+assert_eq "$_ALERT_INVOCATIONS" "1" "alert-cli-fb: legacy message.send invoked"
+
+if [[ -f "${_tmp_dir}/wake.log" ]]; then
+    log_content=$(cat "${_tmp_dir}/wake.log")
+    assert_contains "$log_content" "legacy message.send succeeded" "alert-cli-fb: log notes legacy alert path"
+fi
 
 # ═══════════════════════════════════════════════════════════════
 # P2: whitespace .body falls back to event_payload
@@ -1293,6 +1481,24 @@ _make_empty_string_body_task() {
 }
 
 describe "P2 Parser — whitespace .body falls back to event_payload"
+
+# Restore default openclaw mock (may have been overridden by CLI fallback tests)
+openclaw() {
+    if [[ "${1:-}" == "session" ]] && [[ "${2:-}" == "send" ]]; then
+        shift 2
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --session) _WAKE_LAST_SESSION="$2"; shift 2 ;;
+                --text) _WAKE_LAST_MESSAGE="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        _WAKE_INVOCATIONS=$((_WAKE_INVOCATIONS + 1))
+        return 0
+    fi
+    return 0
+}
+export -f openclaw 2>/dev/null || true
 
 _setup
 task_json=$(_make_whitespace_body_task "p2-ws" 8001 "org/ws-test" 80 "Whitespace body comment")
