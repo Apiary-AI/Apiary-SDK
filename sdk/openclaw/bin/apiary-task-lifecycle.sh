@@ -38,6 +38,30 @@ fi
 _LIFECYCLE_CONFIG_DIR="${APIARY_CONFIG_DIR:-${HOME}/.config/apiary}"
 _LIFECYCLE_TRACE_DIR="${_LIFECYCLE_CONFIG_DIR}/traces"
 
+# ── 409 response body inspection ──────────────────────────────
+
+# Extract the remote task status from a 409 conflict response body.
+# The Apiary API returns:
+#   {"errors":[{"code":"conflict","message":"Task is not in progress. Current status: <status>"}]}
+# We parse the status from the message string.
+#
+# Arguments:
+#   $1 — response body (JSON string from stdout of apiary_complete/fail_task)
+#
+# Outputs: the remote status string (e.g. "completed", "failed", "expired")
+#          or empty string if unparseable.
+_lifecycle_parse_409_status() {
+    local body="${1:-}"
+    [[ -z "$body" ]] && return 0
+    echo "$body" | jq -r '
+        (.errors // [])[] |
+        select(.code == "conflict") |
+        .message // "" |
+        capture("Current status: (?<s>\\S+)") |
+        .s // ""
+    ' 2>/dev/null | head -n1
+}
+
 # ── Trace persistence ─────────────────────────────────────────
 
 # Write a trace record for audit/debugging.
@@ -603,15 +627,34 @@ _lifecycle_process_reminder() {
         saved_status=$(jq -r '.status // "completed"' < "$result_artifact" 2>/dev/null) || saved_status="completed"
         saved_result=$(cat "$result_artifact" 2>/dev/null) || saved_result="{}"
 
-        local api_rc=0
+        local api_rc=0 api_body=""
         if [[ "$saved_status" == "failed" ]]; then
-            apiary_fail_task "$hive_id" "$task_id" -e "$saved_result" >/dev/null 2>&1 || api_rc=$?
+            api_body=$(apiary_fail_task "$hive_id" "$task_id" -e "$saved_result" 2>/dev/null) || api_rc=$?
         else
-            apiary_complete_task "$hive_id" "$task_id" -r "$saved_result" >/dev/null 2>&1 || api_rc=$?
+            api_body=$(apiary_complete_task "$hive_id" "$task_id" -r "$saved_result" 2>/dev/null) || api_rc=$?
         fi
 
-        if [[ $api_rc -eq 0 ]] || [[ $api_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
-            _wake_log "INFO" "lifecycle: reminder terminal retry reconciled for task ${task_id}"
+        if [[ $api_rc -eq 0 ]]; then
+            _wake_log "INFO" "lifecycle: reminder terminal retry succeeded for task ${task_id}"
+            _lifecycle_write_trace "$task_id" "$saved_result"
+            rm -f "$result_artifact"
+            rm -f "${pending_dir}/${task_id}.json"
+            rm -f "${pending_dir}/${task_id}.claimed"
+            rm -f "${pending_dir}/${task_id}.delivered"
+            return 0
+        elif [[ $api_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            local remote_status
+            remote_status=$(_lifecycle_parse_409_status "$api_body")
+            local had_delivery=0
+            [[ -f "${pending_dir}/${task_id}.delivered" ]] && had_delivery=1
+
+            if [[ "$remote_status" == "completed" ]]; then
+                _wake_log "INFO" "lifecycle: reminder terminal retry 409 for task ${task_id}; remote already completed — reconciled"
+            elif [[ $had_delivery -eq 1 ]]; then
+                _wake_log "WARN" "lifecycle: reminder task ${task_id} delivered but remote status is '${remote_status}' (timeout race); delivery was successful — reconciling"
+            else
+                _wake_log "INFO" "lifecycle: reminder terminal retry 409 for task ${task_id}; remote status '${remote_status}' — reconciled"
+            fi
             _lifecycle_write_trace "$task_id" "$saved_result"
             rm -f "$result_artifact"
             rm -f "${pending_dir}/${task_id}.json"
@@ -692,11 +735,26 @@ _lifecycle_process_reminder() {
                 '{"task_id":$id,"status":"completed","processed_by":"daemon","summary":"reconciled: prior delivery confirmed","completed_at":$ts}' \
                 2>/dev/null) || reconcile_json="{\"task_id\":\"${task_id}\",\"status\":\"completed\"}"
 
-            local reconcile_rc=0
-            apiary_complete_task "$hive_id" "$task_id" -r "$reconcile_json" >/dev/null 2>&1 || reconcile_rc=$?
+            local reconcile_rc=0 reconcile_body=""
+            reconcile_body=$(apiary_complete_task "$hive_id" "$task_id" -r "$reconcile_json" 2>/dev/null) || reconcile_rc=$?
 
-            if [[ $reconcile_rc -eq 0 ]] || [[ $reconcile_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
-                _wake_log "INFO" "lifecycle: reminder task ${task_id} reconciled after .delivered evidence (rc=${reconcile_rc})"
+            if [[ $reconcile_rc -eq 0 ]]; then
+                _wake_log "INFO" "lifecycle: reminder task ${task_id} reconciled after .delivered evidence"
+                _lifecycle_write_trace "$task_id" "$reconcile_json"
+                rm -f "${pending_dir}/${task_id}.json"
+                rm -f "${pending_dir}/${task_id}.claimed"
+                rm -f "$delivered_marker"
+                return 0
+            elif [[ $reconcile_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+                local remote_status
+                remote_status=$(_lifecycle_parse_409_status "$reconcile_body")
+                if [[ "$remote_status" == "completed" ]]; then
+                    _wake_log "INFO" "lifecycle: reminder task ${task_id} already completed remotely; .delivered reconciliation OK"
+                elif [[ -n "$remote_status" ]]; then
+                    _wake_log "WARN" "lifecycle: reminder task ${task_id} delivered but remote status is '${remote_status}' (timeout race); delivery was successful — reconciling"
+                else
+                    _wake_log "INFO" "lifecycle: reminder task ${task_id} reconciled after .delivered evidence (409)"
+                fi
                 _lifecycle_write_trace "$task_id" "$reconcile_json"
                 rm -f "${pending_dir}/${task_id}.json"
                 rm -f "${pending_dir}/${task_id}.claimed"
@@ -774,6 +832,7 @@ _lifecycle_process_reminder() {
     now_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')
     local result_json
 
+    local delivered_marker="${pending_dir}/${task_id}.delivered"
     if [[ "$process_status" == "completed" ]]; then
         result_json=$(jq -n \
             --arg id "$task_id" \
@@ -784,8 +843,23 @@ _lifecycle_process_reminder() {
             '{"task_id":$id,"status":"completed","processed_by":"daemon","summary":$summary,"delivery":{"channel":$ch,"target":$tgt},"completed_at":$ts}' \
             2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"completed\"}"
 
-        if apiary_complete_task "$hive_id" "$task_id" -r "$result_json" >/dev/null 2>&1; then
+        local complete_rc=0 complete_body=""
+        complete_body=$(apiary_complete_task "$hive_id" "$task_id" -r "$result_json" 2>/dev/null) || complete_rc=$?
+
+        if [[ $complete_rc -eq 0 ]]; then
             _wake_log "INFO" "lifecycle: reminder completed task ${task_id}: ${process_summary}"
+        elif [[ $complete_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            # 409: task already in a terminal state.  Distinguish scenarios.
+            local remote_status
+            remote_status=$(_lifecycle_parse_409_status "$complete_body")
+            if [[ "$remote_status" == "completed" ]]; then
+                _wake_log "INFO" "lifecycle: reminder task ${task_id} already completed remotely — no conflict"
+            elif [[ -f "$delivered_marker" ]] && [[ -n "$remote_status" ]]; then
+                _wake_log "WARN" "lifecycle: reminder task ${task_id} delivered but remote status is '${remote_status}' (timeout race); delivery was successful — reconciling"
+            else
+                _wake_log "INFO" "lifecycle: reminder task ${task_id} complete 409; remote status '${remote_status:-unknown}' — reconciled"
+            fi
+            # Either way, the task is terminal — proceed to cleanup.
         else
             _wake_log "WARN" "lifecycle: reminder task ${task_id} processed but completion API call failed; saving result artifact for retry"
             echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
@@ -801,8 +875,15 @@ _lifecycle_process_reminder() {
             '{"task_id":$id,"status":"failed","error":$err,"delivery":{"channel":$ch,"target":$tgt},"failed_at":$ts}' \
             2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"failed\"}"
 
-        if apiary_fail_task "$hive_id" "$task_id" -e "$result_json" >/dev/null 2>&1; then
+        local fail_rc=0 fail_body=""
+        fail_body=$(apiary_fail_task "$hive_id" "$task_id" -e "$result_json" 2>/dev/null) || fail_rc=$?
+
+        if [[ $fail_rc -eq 0 ]]; then
             _wake_log "INFO" "lifecycle: reminder failed task ${task_id}: ${process_summary}"
+        elif [[ $fail_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
+            local remote_status
+            remote_status=$(_lifecycle_parse_409_status "$fail_body")
+            _wake_log "INFO" "lifecycle: reminder task ${task_id} fail 409; remote status '${remote_status:-unknown}' — reconciled"
         else
             _wake_log "WARN" "lifecycle: reminder task ${task_id} fail API call failed; saving result artifact for retry"
             echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true

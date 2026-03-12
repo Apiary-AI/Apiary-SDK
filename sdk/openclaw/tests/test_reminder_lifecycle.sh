@@ -12,19 +12,21 @@ _APIARY_SDK_LOADED=1
 _tmp_dir=$(mktemp -d)
 trap 'rm -rf "$_tmp_dir"' EXIT
 
-_CLAIM_CALLS=0
+# Mock state directory — used for subshell-safe counters.
+# When production code captures stdout via $(), the function runs in a
+# subshell, so variable updates are lost.  File-based state survives.
+_MOCK_DIR=""
+
 _CLAIM_RC=0
-_COMPLETE_CALLS=0
-_COMPLETE_LAST_TASK=""
-_COMPLETE_LAST_RESULT=""
-_FAIL_CALLS=0
-_FAIL_LAST_TASK=""
-_FAIL_LAST_ERROR=""
-_SEND_CALLS=0
-_SEND_LAST_TARGET=""
-_SEND_LAST_CHANNEL=""
-_SEND_LAST_MESSAGE=""
+_COMPLETE_RC=0
+_COMPLETE_BODY=""
+_FAIL_RC=0
+_FAIL_BODY=""
 _SEND_RC=0
+
+# Read a mock counter from file (subshell-safe).
+_mock_read() { cat "${_MOCK_DIR}/${1}" 2>/dev/null || echo ""; }
+_mock_read_n() { local v; v=$(cat "${_MOCK_DIR}/${1}" 2>/dev/null) || v=0; echo "$v"; }
 
 _setup() {
     export APIARY_CONFIG_DIR="$_tmp_dir"
@@ -40,18 +42,20 @@ _setup() {
     rm -rf "${PENDING_DIR}/quarantine" 2>/dev/null || true
     rm -rf "${_tmp_dir}/traces"
 
-    _CLAIM_CALLS=0
+    # Reset mock state via files (subshell-safe)
+    _MOCK_DIR="${_tmp_dir}/mock"
+    rm -rf "$_MOCK_DIR"
+    mkdir -p "$_MOCK_DIR"
+    echo 0 > "${_MOCK_DIR}/claim_calls"
+    echo 0 > "${_MOCK_DIR}/complete_calls"
+    echo 0 > "${_MOCK_DIR}/fail_calls"
+    echo 0 > "${_MOCK_DIR}/send_calls"
+
     _CLAIM_RC=0
-    _COMPLETE_CALLS=0
-    _COMPLETE_LAST_TASK=""
-    _COMPLETE_LAST_RESULT=""
-    _FAIL_CALLS=0
-    _FAIL_LAST_TASK=""
-    _FAIL_LAST_ERROR=""
-    _SEND_CALLS=0
-    _SEND_LAST_TARGET=""
-    _SEND_LAST_CHANNEL=""
-    _SEND_LAST_MESSAGE=""
+    _COMPLETE_RC=0
+    _COMPLETE_BODY=""
+    _FAIL_RC=0
+    _FAIL_BODY=""
     _SEND_RC=0
     _TRACE_RC=1
     _TRACE_OUTPUT=""
@@ -60,43 +64,45 @@ _setup() {
     source "${SCRIPT_DIR}/../bin/apiary-task-lifecycle.sh"
 
     apiary_claim_task() {
-        _CLAIM_CALLS=$((_CLAIM_CALLS + 1))
+        local n; n=$(cat "${_MOCK_DIR}/claim_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/claim_calls"
         return $_CLAIM_RC
     }
 
     apiary_complete_task() {
         local task_id="$2"
         shift 2
-        _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
-        _COMPLETE_LAST_TASK="$task_id"
+        local n; n=$(cat "${_MOCK_DIR}/complete_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/complete_calls"
+        echo "$task_id" > "${_MOCK_DIR}/complete_last_task"
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
+                -r) echo "$2" > "${_MOCK_DIR}/complete_last_result"; shift 2 ;;
                 *) shift ;;
             esac
         done
-        return 0
+        [[ -n "$_COMPLETE_BODY" ]] && echo "$_COMPLETE_BODY"
+        return $_COMPLETE_RC
     }
 
     apiary_fail_task() {
         local task_id="$2"
         shift 2
-        _FAIL_CALLS=$((_FAIL_CALLS + 1))
-        _FAIL_LAST_TASK="$task_id"
+        local n; n=$(cat "${_MOCK_DIR}/fail_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/fail_calls"
+        echo "$task_id" > "${_MOCK_DIR}/fail_last_task"
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -e) _FAIL_LAST_ERROR="$2"; shift 2 ;;
+                -e) echo "$2" > "${_MOCK_DIR}/fail_last_error"; shift 2 ;;
                 *) shift ;;
             esac
         done
-        return 0
+        [[ -n "$_FAIL_BODY" ]] && echo "$_FAIL_BODY"
+        return $_FAIL_RC
     }
 
     _wake_send_alert() {
-        _SEND_CALLS=$((_SEND_CALLS + 1))
-        _SEND_LAST_TARGET="${1:-}"
-        _SEND_LAST_CHANNEL="${2:-}"
-        _SEND_LAST_MESSAGE="${3:-}"
+        local n; n=$(cat "${_MOCK_DIR}/send_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/send_calls"
+        echo "${1:-}" > "${_MOCK_DIR}/send_last_target"
+        echo "${2:-}" > "${_MOCK_DIR}/send_last_channel"
+        echo "${3:-}" > "${_MOCK_DIR}/send_last_message"
         return $_SEND_RC
     }
 
@@ -160,14 +166,14 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "returns 0 on successful reminder delivery"
-assert_eq "$_CLAIM_CALLS" "1" "claim called once"
-assert_eq "$_SEND_CALLS" "1" "message delivery called once"
-assert_eq "$_SEND_LAST_CHANNEL" "telegram" "delivery uses parsed channel"
-assert_eq "$_SEND_LAST_TARGET" "94650650" "delivery uses parsed target"
-assert_eq "$_SEND_LAST_MESSAGE" "Ship build" "delivery uses parsed message"
-assert_eq "$_COMPLETE_CALLS" "1" "complete called once"
-assert_eq "$_FAIL_CALLS" "0" "fail not called on success"
-assert_contains "$_COMPLETE_LAST_RESULT" "completed" "complete result includes status"
+assert_eq "$(_mock_read_n claim_calls)" "1" "claim called once"
+assert_eq "$(_mock_read_n send_calls)" "1" "message delivery called once"
+assert_eq "$(_mock_read send_last_channel)" "telegram" "delivery uses parsed channel"
+assert_eq "$(_mock_read send_last_target)" "94650650" "delivery uses parsed target"
+assert_eq "$(_mock_read send_last_message)" "Ship build" "delivery uses parsed message"
+assert_eq "$(_mock_read_n complete_calls)" "1" "complete called once"
+assert_eq "$(_mock_read_n fail_calls)" "0" "fail not called on success"
+assert_contains "$(_mock_read complete_last_result)" "completed" "complete result includes status"
 assert_eq "$([ -f "${PENDING_DIR}/rem-ok.json" ] && echo exists || echo removed)" "removed" "pending file removed after success"
 assert_eq "$([ -f "${_tmp_dir}/traces/rem-ok.json" ] && echo exists || echo missing)" "exists" "trace file written"
 
@@ -184,11 +190,11 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "returns 0 after failing invalid reminder"
-assert_eq "$_CLAIM_CALLS" "1" "claim still called before validation"
-assert_eq "$_SEND_CALLS" "0" "delivery not attempted for invalid payload"
-assert_eq "$_COMPLETE_CALLS" "0" "complete not called on validation failure"
-assert_eq "$_FAIL_CALLS" "1" "fail called on validation failure"
-assert_contains "$_FAIL_LAST_ERROR" "validation failed" "fail payload includes validation error"
+assert_eq "$(_mock_read_n claim_calls)" "1" "claim still called before validation"
+assert_eq "$(_mock_read_n send_calls)" "0" "delivery not attempted for invalid payload"
+assert_eq "$(_mock_read_n complete_calls)" "0" "complete not called on validation failure"
+assert_eq "$(_mock_read_n fail_calls)" "1" "fail called on validation failure"
+assert_contains "$(_mock_read fail_last_error)" "validation failed" "fail payload includes validation error"
 assert_eq "$([ -f "${PENDING_DIR}/rem-bad.json" ] && echo exists || echo removed)" "removed" "pending file removed after validation failure"
 
 
@@ -205,10 +211,10 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "returns 0 after failing delivery"
-assert_eq "$_SEND_CALLS" "1" "delivery attempted once"
-assert_eq "$_COMPLETE_CALLS" "0" "complete not called when delivery fails"
-assert_eq "$_FAIL_CALLS" "1" "fail called when delivery fails"
-assert_contains "$_FAIL_LAST_ERROR" "delivery failed" "fail payload includes delivery error"
+assert_eq "$(_mock_read_n send_calls)" "1" "delivery attempted once"
+assert_eq "$(_mock_read_n complete_calls)" "0" "complete not called when delivery fails"
+assert_eq "$(_mock_read_n fail_calls)" "1" "fail called when delivery fails"
+assert_contains "$(_mock_read fail_last_error)" "delivery failed" "fail payload includes delivery error"
 
 
 describe "Retry sweep — processes reminder and explicitly fails unsupported types"
@@ -222,9 +228,9 @@ echo "$other_task" > "${PENDING_DIR}/other-1.json"
 
 _lifecycle_retry_pending_handlers
 
-assert_eq "$_CLAIM_CALLS" "2" "retry sweep claims reminder and unsupported task"
-assert_eq "$_COMPLETE_CALLS" "1" "retry sweep completes reminder task"
-assert_eq "$_FAIL_CALLS" "1" "retry sweep fails unsupported task with explicit response"
+assert_eq "$(_mock_read_n claim_calls)" "2" "retry sweep claims reminder and unsupported task"
+assert_eq "$(_mock_read_n complete_calls)" "1" "retry sweep completes reminder task"
+assert_eq "$(_mock_read_n fail_calls)" "1" "retry sweep fails unsupported task with explicit response"
 assert_eq "$([ -f "${PENDING_DIR}/rem-retry.json" ] && echo exists || echo removed)" "removed" "retry sweep removes reminder pending file"
 assert_eq "$([ -f "${PENDING_DIR}/other-1.json" ] && echo exists || echo removed)" "removed" "retry sweep removes unsupported pending file after fail"
 
@@ -250,14 +256,14 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "crash-recovery: returns 0"
-assert_eq "$_SEND_CALLS" "1" "crash-recovery: delivery attempted (re-processed)"
-assert_eq "$_SEND_LAST_TARGET" "94650650" "crash-recovery: correct target"
-assert_eq "$_SEND_LAST_CHANNEL" "telegram" "crash-recovery: correct channel"
-assert_eq "$_SEND_LAST_MESSAGE" "Crash recovery reminder" "crash-recovery: correct message"
-assert_eq "$_COMPLETE_CALLS" "1" "crash-recovery: task completed (not dropped)"
-assert_eq "$_FAIL_CALLS" "0" "crash-recovery: fail NOT called (no force-fail)"
-assert_contains "$_COMPLETE_LAST_RESULT" "completed" "crash-recovery: result confirms completion"
-assert_contains "$_COMPLETE_LAST_RESULT" "delivered" "crash-recovery: result confirms delivery"
+assert_eq "$(_mock_read_n send_calls)" "1" "crash-recovery: delivery attempted (re-processed)"
+assert_eq "$(_mock_read send_last_target)" "94650650" "crash-recovery: correct target"
+assert_eq "$(_mock_read send_last_channel)" "telegram" "crash-recovery: correct channel"
+assert_eq "$(_mock_read send_last_message)" "Crash recovery reminder" "crash-recovery: correct message"
+assert_eq "$(_mock_read_n complete_calls)" "1" "crash-recovery: task completed (not dropped)"
+assert_eq "$(_mock_read_n fail_calls)" "0" "crash-recovery: fail NOT called (no force-fail)"
+assert_contains "$(_mock_read complete_last_result)" "completed" "crash-recovery: result confirms completion"
+assert_contains "$(_mock_read complete_last_result)" "delivered" "crash-recovery: result confirms delivery"
 assert_eq "$([ -f "${PENDING_DIR}/rem-crash.claimed" ] && echo exists || echo removed)" "removed" \
     "crash-recovery: .claimed marker cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-crash.json" ] && echo exists || echo removed)" "removed" \
@@ -285,10 +291,10 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "crash-delfail: returns 0 (fail-soft)"
-assert_eq "$_SEND_CALLS" "1" "crash-delfail: delivery attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "crash-delfail: complete NOT called (delivery failed)"
-assert_eq "$_FAIL_CALLS" "1" "crash-delfail: fail called (delivery failure)"
-assert_contains "$_FAIL_LAST_ERROR" "delivery failed" "crash-delfail: error mentions delivery failure"
+assert_eq "$(_mock_read_n send_calls)" "1" "crash-delfail: delivery attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "crash-delfail: complete NOT called (delivery failed)"
+assert_eq "$(_mock_read_n fail_calls)" "1" "crash-delfail: fail called (delivery failure)"
+assert_contains "$(_mock_read fail_last_error)" "delivery failed" "crash-delfail: error mentions delivery failure"
 assert_eq "$([ -f "${PENDING_DIR}/rem-crash-delfail.claimed" ] && echo exists || echo removed)" "removed" \
     "crash-delfail: .claimed marker cleaned up"
 
@@ -305,19 +311,7 @@ _CLAIM_RC=$APIARY_ERR_CONFLICT
 _write_test_claimed_marker "rem-crash-apifail"
 
 # Override complete_task to fail
-apiary_complete_task() {
-    local task_id="$2"
-    shift 2
-    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
-    _COMPLETE_LAST_TASK="$task_id"
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    return 1  # simulate API failure
-}
+_COMPLETE_RC=1
 
 task_json=$(_make_reminder_task "rem-crash-apifail" "telegram" "555" "API will fail")
 echo "$task_json" > "${PENDING_DIR}/rem-crash-apifail.json"
@@ -328,7 +322,7 @@ rc=$?
 set -e
 
 assert_eq "$rc" "1" "crash-apifail: returns 1 (retryable)"
-assert_eq "$_SEND_CALLS" "1" "crash-apifail: delivery was attempted"
+assert_eq "$(_mock_read_n send_calls)" "1" "crash-apifail: delivery was attempted"
 assert_eq "$([ -f "${PENDING_DIR}/rem-crash-apifail.result.json" ] && echo exists || echo missing)" "exists" \
     "crash-apifail: result artifact saved for retry"
 assert_eq "$([ -f "${PENDING_DIR}/rem-crash-apifail.claimed" ] && echo exists || echo missing)" "exists" \
@@ -354,9 +348,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "foreign: returns 0 (graceful skip)"
-assert_eq "$_SEND_CALLS" "0" "foreign: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "foreign: complete NOT called"
-assert_eq "$_FAIL_CALLS" "0" "foreign: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "foreign: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "foreign: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "foreign: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/rem-foreign.json" ] && echo exists || echo moved)" "moved" \
     "foreign: pending file moved from active"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-foreign.json" ] && echo quarantined || echo missing)" "quarantined" \
@@ -384,9 +378,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "wrong-agent: returns 0 (graceful quarantine)"
-assert_eq "$_SEND_CALLS" "0" "wrong-agent: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "wrong-agent: complete NOT called"
-assert_eq "$_FAIL_CALLS" "0" "wrong-agent: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "wrong-agent: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "wrong-agent: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "wrong-agent: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-wrong-agent.json" ] && echo quarantined || echo missing)" "quarantined" \
     "wrong-agent: pending file quarantined"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-wrong-agent.claimed" ] && echo quarantined || echo missing)" "quarantined" \
@@ -415,9 +409,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "stale: returns 0 (graceful quarantine)"
-assert_eq "$_SEND_CALLS" "0" "stale: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "stale: complete NOT called"
-assert_eq "$_FAIL_CALLS" "0" "stale: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "stale: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "stale: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "stale: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-stale.json" ] && echo quarantined || echo missing)" "quarantined" \
     "stale: pending file quarantined"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-stale.claimed" ] && echo quarantined || echo missing)" "quarantined" \
@@ -445,9 +439,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "legacy: returns 0 (graceful quarantine)"
-assert_eq "$_SEND_CALLS" "0" "legacy: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "legacy: complete NOT called"
-assert_eq "$_FAIL_CALLS" "0" "legacy: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "legacy: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "legacy: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "legacy: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-legacy.json" ] && echo quarantined || echo missing)" "quarantined" \
     "legacy: pending file quarantined"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-legacy.claimed" ] && echo quarantined || echo missing)" "quarantined" \
@@ -476,9 +470,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "mismatch: returns 0 (graceful quarantine)"
-assert_eq "$_SEND_CALLS" "0" "mismatch: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "mismatch: complete NOT called"
-assert_eq "$_FAIL_CALLS" "0" "mismatch: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "mismatch: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "mismatch: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "mismatch: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/quarantine/rem-mismatch.json" ] && echo quarantined || echo missing)" "quarantined" \
     "mismatch: pending file quarantined"
 
@@ -500,9 +494,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "1" "neterr: returns 1 on claim network error"
-assert_eq "$_SEND_CALLS" "0" "neterr: delivery NOT attempted"
-assert_eq "$_COMPLETE_CALLS" "0" "neterr: complete not called"
-assert_eq "$_FAIL_CALLS" "0" "neterr: fail not called"
+assert_eq "$(_mock_read_n send_calls)" "0" "neterr: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "0" "neterr: complete not called"
+assert_eq "$(_mock_read_n fail_calls)" "0" "neterr: fail not called"
 assert_eq "$([ -f "${PENDING_DIR}/rem-neterr.json" ] && echo exists || echo removed)" "exists" \
     "neterr: pending file preserved for retry"
 
@@ -516,24 +510,19 @@ describe "Crash recovery — full round-trip: claim OK, crash, 409+.claimed re-d
 _setup
 
 # Phase 1: claim succeeds, delivery succeeds, complete API fails → artifact saved
-_complete_call_count=0
-apiary_claim_task() {
-    _CLAIM_CALLS=$((_CLAIM_CALLS + 1))
-    return $_CLAIM_RC
-}
+# Override complete_task to fail on first call, succeed on subsequent
 apiary_complete_task() {
     local task_id="$2"
     shift 2
-    _complete_call_count=$((_complete_call_count + 1))
-    _COMPLETE_CALLS=$_complete_call_count
-    _COMPLETE_LAST_TASK="$task_id"
+    local n; n=$(cat "${_MOCK_DIR}/complete_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/complete_calls"
+    echo "$task_id" > "${_MOCK_DIR}/complete_last_task"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
+            -r) echo "$2" > "${_MOCK_DIR}/complete_last_result"; shift 2 ;;
             *) shift ;;
         esac
     done
-    if [[ $_complete_call_count -eq 1 ]]; then
+    if [[ $(( n + 1 )) -eq 1 ]]; then
         return 1  # first: API failure
     fi
     return 0  # subsequent: success
@@ -548,7 +537,7 @@ r1=$?
 set -e
 
 assert_eq "$r1" "1" "roundtrip-r1: returns 1 (terminal API failed)"
-assert_eq "$_SEND_CALLS" "1" "roundtrip-r1: delivery was attempted"
+assert_eq "$(_mock_read_n send_calls)" "1" "roundtrip-r1: delivery was attempted"
 assert_eq "$([ -f "${PENDING_DIR}/rem-roundtrip.result.json" ] && echo exists || echo missing)" "exists" \
     "roundtrip-r1: result artifact saved"
 assert_eq "$([ -f "${PENDING_DIR}/rem-roundtrip.claimed" ] && echo exists || echo missing)" "exists" \
@@ -580,18 +569,17 @@ _CLAIM_RC=0
 task_json=$(_make_reminder_task "rem-marker" "telegram" "333" "Marker test")
 echo "$task_json" > "${PENDING_DIR}/rem-marker.json"
 
-# Override complete_task to capture but also check marker before cleanup
-_marker_content=""
+# Override complete_task to capture marker before cleanup
 apiary_complete_task() {
     local task_id="$2"
     shift 2
-    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
-    _COMPLETE_LAST_TASK="$task_id"
+    local n; n=$(cat "${_MOCK_DIR}/complete_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/complete_calls"
+    echo "$task_id" > "${_MOCK_DIR}/complete_last_task"
     # Capture marker content while it still exists (before cleanup in Step 5)
-    _marker_content=$(cat "${PENDING_DIR}/rem-marker.claimed" 2>/dev/null) || _marker_content=""
+    cp "${PENDING_DIR}/rem-marker.claimed" "${_MOCK_DIR}/captured_marker" 2>/dev/null || true
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
+            -r) echo "$2" > "${_MOCK_DIR}/complete_last_result"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -600,13 +588,14 @@ apiary_complete_task() {
 
 _lifecycle_process_reminder "$task_json" "rem-marker"
 
-assert_eq "$_COMPLETE_CALLS" "1" "marker: task completed"
+assert_eq "$(_mock_read_n complete_calls)" "1" "marker: task completed"
 assert_eq "$([ -f "${PENDING_DIR}/rem-marker.claimed" ] && echo exists || echo removed)" "removed" \
     "marker: .claimed cleaned up after success"
 assert_eq "$([ -f "${PENDING_DIR}/rem-marker.json" ] && echo exists || echo removed)" "removed" \
     "marker: pending file cleaned up after success"
 
 # Verify JSON marker format with ownership evidence
+_marker_content=$(cat "${_MOCK_DIR}/captured_marker" 2>/dev/null) || _marker_content=""
 marker_tid=$(echo "$_marker_content" | jq -r '.task_id // ""' 2>/dev/null) || marker_tid=""
 marker_agent=$(echo "$_marker_content" | jq -r '.agent_id // ""' 2>/dev/null) || marker_agent=""
 assert_eq "$marker_tid" "rem-marker" "marker: JSON marker contains correct task_id"
@@ -638,9 +627,9 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-trace: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-trace: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "0" "dup-trace: complete NOT called (already done)"
-assert_eq "$_FAIL_CALLS" "0" "dup-trace: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-trace: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "dup-trace: complete NOT called (already done)"
+assert_eq "$(_mock_read_n fail_calls)" "0" "dup-trace: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-trace.json" ] && echo exists || echo removed)" "removed" \
     "dup-trace: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-trace.claimed" ] && echo exists || echo removed)" "removed" \
@@ -671,10 +660,10 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-delivered: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-delivered: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "1" "dup-delivered: complete called (reconciliation)"
-assert_eq "$_FAIL_CALLS" "0" "dup-delivered: fail NOT called"
-assert_contains "$_COMPLETE_LAST_RESULT" "reconciled" "dup-delivered: result mentions reconciliation"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-delivered: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "1" "dup-delivered: complete called (reconciliation)"
+assert_eq "$(_mock_read_n fail_calls)" "0" "dup-delivered: fail NOT called"
+assert_contains "$(_mock_read complete_last_result)" "reconciled" "dup-delivered: result mentions reconciliation"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-delivered.json" ] && echo exists || echo removed)" "removed" \
     "dup-delivered: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-delivered.claimed" ] && echo exists || echo removed)" "removed" \
@@ -699,19 +688,7 @@ _write_test_claimed_marker "rem-dup-apifail"
 echo "rem-dup-apifail" > "${PENDING_DIR}/rem-dup-apifail.delivered"
 
 # Override complete_task to fail
-apiary_complete_task() {
-    local task_id="$2"
-    shift 2
-    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
-    _COMPLETE_LAST_TASK="$task_id"
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    return 1  # simulate API failure
-}
+_COMPLETE_RC=1
 
 task_json=$(_make_reminder_task "rem-dup-apifail" "telegram" "555" "API will fail")
 echo "$task_json" > "${PENDING_DIR}/rem-dup-apifail.json"
@@ -722,8 +699,8 @@ rc=$?
 set -e
 
 assert_eq "$rc" "1" "dup-apifail: returns 1 (retryable)"
-assert_eq "$_SEND_CALLS" "0" "dup-apifail: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "1" "dup-apifail: complete attempted (reconciliation)"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-apifail: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "1" "dup-apifail: complete attempted (reconciliation)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-apifail.result.json" ] && echo exists || echo missing)" "exists" \
     "dup-apifail: result artifact saved for retry"
 
@@ -760,8 +737,8 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-remote: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-remote: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "0" "dup-remote: complete NOT called (remote already terminal)"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-remote: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "dup-remote: complete NOT called (remote already terminal)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-remote.json" ] && echo exists || echo removed)" "removed" \
     "dup-remote: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-remote.claimed" ] && echo exists || echo removed)" "removed" \
@@ -799,8 +776,8 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-cancelled: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-cancelled: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "0" "dup-cancelled: complete NOT called (remote already terminal)"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-cancelled: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "dup-cancelled: complete NOT called (remote already terminal)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-cancelled.json" ] && echo exists || echo removed)" "removed" \
     "dup-cancelled: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-cancelled.claimed" ] && echo exists || echo removed)" "removed" \
@@ -838,8 +815,8 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-deadletter: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-deadletter: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "0" "dup-deadletter: complete NOT called (remote already terminal)"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-deadletter: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "dup-deadletter: complete NOT called (remote already terminal)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-deadletter.json" ] && echo exists || echo removed)" "removed" \
     "dup-deadletter: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-deadletter.claimed" ] && echo exists || echo removed)" "removed" \
@@ -877,8 +854,8 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "dup-expired: returns 0 (reconciled)"
-assert_eq "$_SEND_CALLS" "0" "dup-expired: delivery NOT attempted (duplicate prevented)"
-assert_eq "$_COMPLETE_CALLS" "0" "dup-expired: complete NOT called (remote already terminal)"
+assert_eq "$(_mock_read_n send_calls)" "0" "dup-expired: delivery NOT attempted (duplicate prevented)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "dup-expired: complete NOT called (remote already terminal)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-expired.json" ] && echo exists || echo removed)" "removed" \
     "dup-expired: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dup-expired.claimed" ] && echo exists || echo removed)" "removed" \
@@ -919,12 +896,12 @@ rc=$?
 set -e
 
 assert_eq "$rc" "0" "precrash: returns 0 (delivered successfully)"
-assert_eq "$_SEND_CALLS" "1" "precrash: delivery attempted (correct for pre-delivery crash)"
-assert_eq "$_SEND_LAST_TARGET" "42" "precrash: correct target"
-assert_eq "$_SEND_LAST_CHANNEL" "telegram" "precrash: correct channel"
-assert_eq "$_SEND_LAST_MESSAGE" "Pre-delivery crash reminder" "precrash: correct message"
-assert_eq "$_COMPLETE_CALLS" "1" "precrash: task completed"
-assert_eq "$_FAIL_CALLS" "0" "precrash: fail NOT called"
+assert_eq "$(_mock_read_n send_calls)" "1" "precrash: delivery attempted (correct for pre-delivery crash)"
+assert_eq "$(_mock_read send_last_target)" "42" "precrash: correct target"
+assert_eq "$(_mock_read send_last_channel)" "telegram" "precrash: correct channel"
+assert_eq "$(_mock_read send_last_message)" "Pre-delivery crash reminder" "precrash: correct message"
+assert_eq "$(_mock_read_n complete_calls)" "1" "precrash: task completed"
+assert_eq "$(_mock_read_n fail_calls)" "0" "precrash: fail NOT called"
 assert_eq "$([ -f "${PENDING_DIR}/rem-precrash.json" ] && echo exists || echo removed)" "removed" \
     "precrash: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-precrash.claimed" ] && echo exists || echo removed)" "removed" \
@@ -943,17 +920,20 @@ task_json=$(_make_reminder_task "rem-dmarker" "telegram" "333" "Delivered marker
 echo "$task_json" > "${PENDING_DIR}/rem-dmarker.json"
 
 # Override complete_task to check .delivered exists before cleanup
-_delivered_exists_before_cleanup=""
 apiary_complete_task() {
     local task_id="$2"
     shift 2
-    _COMPLETE_CALLS=$((_COMPLETE_CALLS + 1))
-    _COMPLETE_LAST_TASK="$task_id"
+    local n; n=$(cat "${_MOCK_DIR}/complete_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/complete_calls"
+    echo "$task_id" > "${_MOCK_DIR}/complete_last_task"
     # Check .delivered marker while it still exists (before Step 5 cleanup)
-    _delivered_exists_before_cleanup=$([ -f "${PENDING_DIR}/rem-dmarker.delivered" ] && echo exists || echo missing)
+    if [[ -f "${PENDING_DIR}/rem-dmarker.delivered" ]]; then
+        echo "exists" > "${_MOCK_DIR}/delivered_check"
+    else
+        echo "missing" > "${_MOCK_DIR}/delivered_check"
+    fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -r) _COMPLETE_LAST_RESULT="$2"; shift 2 ;;
+            -r) echo "$2" > "${_MOCK_DIR}/complete_last_result"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -962,12 +942,229 @@ apiary_complete_task() {
 
 _lifecycle_process_reminder "$task_json" "rem-dmarker"
 
-assert_eq "$_COMPLETE_CALLS" "1" "dmarker: task completed"
-assert_eq "$_delivered_exists_before_cleanup" "exists" "dmarker: .delivered exists during complete (before cleanup)"
+assert_eq "$(_mock_read_n complete_calls)" "1" "dmarker: task completed"
+assert_eq "$(_mock_read delivered_check)" "exists" "dmarker: .delivered exists during complete (before cleanup)"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dmarker.delivered" ] && echo exists || echo removed)" "removed" \
     "dmarker: .delivered cleaned up after success"
 assert_eq "$([ -f "${PENDING_DIR}/rem-dmarker.json" ] && echo exists || echo removed)" "removed" \
     "dmarker: pending file cleaned up"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: 409 response body parsing — _lifecycle_parse_409_status
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 parser — extracts status from conflict response body"
+
+_setup
+
+# Standard Apiary 409 format
+body='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: completed"}]}'
+parsed=$(_lifecycle_parse_409_status "$body")
+assert_eq "$parsed" "completed" "parse_409: extracts 'completed'"
+
+body='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: failed"}]}'
+parsed=$(_lifecycle_parse_409_status "$body")
+assert_eq "$parsed" "failed" "parse_409: extracts 'failed'"
+
+body='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: expired"}]}'
+parsed=$(_lifecycle_parse_409_status "$body")
+assert_eq "$parsed" "expired" "parse_409: extracts 'expired'"
+
+# Empty / missing body
+parsed=$(_lifecycle_parse_409_status "")
+assert_eq "$parsed" "" "parse_409: empty string for empty body"
+
+parsed=$(_lifecycle_parse_409_status '{"errors":[]}')
+assert_eq "$parsed" "" "parse_409: empty string for no errors"
+
+parsed=$(_lifecycle_parse_409_status '{"errors":[{"code":"other","message":"Something else"}]}')
+assert_eq "$parsed" "" "parse_409: empty string for non-conflict code"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: Delivered + complete 409 (already completed) → no false-fail
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — delivered + complete 409 (already completed) reconciles cleanly"
+
+_setup
+_COMPLETE_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: completed"}]}'
+
+task_json=$(_make_reminder_task "rem-409-completed" "telegram" "42" "Already completed")
+echo "$task_json" > "${PENDING_DIR}/rem-409-completed.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-409-completed"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "409-completed: returns 0 (reconciled, not error)"
+assert_eq "$(_mock_read_n send_calls)" "1" "409-completed: delivery was attempted"
+assert_eq "$(_mock_read_n complete_calls)" "1" "409-completed: complete was attempted"
+assert_eq "$(_mock_read_n fail_calls)" "0" "409-completed: fail NOT called"
+assert_eq "$([ -f "${PENDING_DIR}/rem-409-completed.json" ] && echo exists || echo removed)" "removed" \
+    "409-completed: pending file cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-409-completed.result.json" ] && echo exists || echo removed)" "removed" \
+    "409-completed: no result artifact saved (reconciled)"
+assert_eq "$([ -f "${_tmp_dir}/traces/rem-409-completed.json" ] && echo exists || echo missing)" "exists" \
+    "409-completed: trace written"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: Delivered + complete 409 (failed — timeout race) → reconcile with warning
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — delivered + complete 409 (remote failed = timeout race) reconciles"
+
+_setup
+_COMPLETE_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: failed"}]}'
+
+task_json=$(_make_reminder_task "rem-409-failed" "telegram" "42" "Timeout race")
+echo "$task_json" > "${PENDING_DIR}/rem-409-failed.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-409-failed"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "409-failed: returns 0 (reconciled despite timeout race)"
+assert_eq "$(_mock_read_n send_calls)" "1" "409-failed: delivery was attempted"
+assert_eq "$(_mock_read_n complete_calls)" "1" "409-failed: complete was attempted"
+assert_eq "$(_mock_read_n fail_calls)" "0" "409-failed: fail NOT called (delivery succeeded)"
+assert_eq "$([ -f "${PENDING_DIR}/rem-409-failed.json" ] && echo exists || echo removed)" "removed" \
+    "409-failed: pending file cleaned up (not stuck)"
+assert_eq "$([ -f "${PENDING_DIR}/rem-409-failed.result.json" ] && echo exists || echo removed)" "removed" \
+    "409-failed: no result artifact saved"
+assert_eq "$([ -f "${_tmp_dir}/traces/rem-409-failed.json" ] && echo exists || echo missing)" "exists" \
+    "409-failed: trace written"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: Step 0 artifact retry + 409 (delivered + remote failed) → reconcile
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — artifact retry with .delivered + 409 failed reconciles"
+
+_setup
+_COMPLETE_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: failed"}]}'
+
+# Simulate: result artifact saved from prior run, .delivered marker exists
+echo '{"task_id":"rem-art-409","status":"completed","summary":"delivered"}' > "${PENDING_DIR}/rem-art-409.result.json"
+echo "rem-art-409" > "${PENDING_DIR}/rem-art-409.delivered"
+_write_test_claimed_marker "rem-art-409"
+
+task_json=$(_make_reminder_task "rem-art-409" "telegram" "42" "Artifact retry")
+echo "$task_json" > "${PENDING_DIR}/rem-art-409.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-art-409"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "art-409: returns 0 (reconciled)"
+assert_eq "$(_mock_read_n send_calls)" "0" "art-409: delivery NOT re-attempted (artifact retry path)"
+assert_eq "$(_mock_read_n complete_calls)" "1" "art-409: complete attempted via artifact"
+assert_eq "$([ -f "${PENDING_DIR}/rem-art-409.result.json" ] && echo exists || echo removed)" "removed" \
+    "art-409: result artifact cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-art-409.delivered" ] && echo exists || echo removed)" "removed" \
+    "art-409: .delivered marker cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-art-409.json" ] && echo exists || echo removed)" "removed" \
+    "art-409: pending file cleaned up"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: .delivered reconciliation + 409 (already completed) → no false-fail
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — .delivered reconciliation + 409 completed = clean"
+
+_setup
+_CLAIM_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: completed"}]}'
+
+_write_test_claimed_marker "rem-deliv-409"
+echo "rem-deliv-409" > "${PENDING_DIR}/rem-deliv-409.delivered"
+
+task_json=$(_make_reminder_task "rem-deliv-409" "telegram" "42" "Should not re-deliver")
+echo "$task_json" > "${PENDING_DIR}/rem-deliv-409.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-deliv-409"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "deliv-409: returns 0 (reconciled)"
+assert_eq "$(_mock_read_n send_calls)" "0" "deliv-409: delivery NOT attempted"
+assert_eq "$(_mock_read_n complete_calls)" "1" "deliv-409: complete called for reconciliation"
+assert_eq "$([ -f "${PENDING_DIR}/rem-deliv-409.json" ] && echo exists || echo removed)" "removed" \
+    "deliv-409: pending file cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-deliv-409.delivered" ] && echo exists || echo removed)" "removed" \
+    "deliv-409: .delivered marker cleaned up"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: .delivered reconciliation + 409 (failed = timeout race) → reconcile
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — .delivered reconciliation + 409 failed (timeout race) reconciles"
+
+_setup
+_CLAIM_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_RC=$APIARY_ERR_CONFLICT
+_COMPLETE_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: failed"}]}'
+
+_write_test_claimed_marker "rem-deliv-race"
+echo "rem-deliv-race" > "${PENDING_DIR}/rem-deliv-race.delivered"
+
+task_json=$(_make_reminder_task "rem-deliv-race" "telegram" "42" "Timeout race via delivered")
+echo "$task_json" > "${PENDING_DIR}/rem-deliv-race.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-deliv-race"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "deliv-race: returns 0 (reconciled despite timeout race)"
+assert_eq "$(_mock_read_n send_calls)" "0" "deliv-race: delivery NOT re-attempted"
+assert_eq "$(_mock_read_n complete_calls)" "1" "deliv-race: complete attempted for reconciliation"
+assert_eq "$([ -f "${PENDING_DIR}/rem-deliv-race.json" ] && echo exists || echo removed)" "removed" \
+    "deliv-race: pending file cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-deliv-race.delivered" ] && echo exists || echo removed)" "removed" \
+    "deliv-race: .delivered marker cleaned up"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P3: Fail-path 409 also reconciles (no stuck tasks)
+# ═══════════════════════════════════════════════════════════════
+
+describe "409 handling — fail-path 409 reconciles cleanly"
+
+_setup
+_SEND_RC=1  # delivery fails
+_FAIL_RC=$APIARY_ERR_CONFLICT
+_FAIL_BODY='{"errors":[{"code":"conflict","message":"Task is not in progress. Current status: failed"}]}'
+
+task_json=$(_make_reminder_task "rem-fail-409" "telegram" "42" "Fail path 409")
+echo "$task_json" > "${PENDING_DIR}/rem-fail-409.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-fail-409"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "fail-409: returns 0 (reconciled)"
+assert_eq "$(_mock_read_n send_calls)" "1" "fail-409: delivery was attempted (and failed)"
+assert_eq "$(_mock_read_n complete_calls)" "0" "fail-409: complete NOT called"
+assert_eq "$(_mock_read_n fail_calls)" "1" "fail-409: fail was attempted"
+assert_eq "$([ -f "${PENDING_DIR}/rem-fail-409.json" ] && echo exists || echo removed)" "removed" \
+    "fail-409: pending file cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-fail-409.result.json" ] && echo exists || echo removed)" "removed" \
+    "fail-409: no result artifact saved"
 
 
 test_summary
