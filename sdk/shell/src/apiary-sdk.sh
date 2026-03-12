@@ -25,6 +25,10 @@ readonly APIARY_ERR_PERMISSION=4   # 403
 readonly APIARY_ERR_NOT_FOUND=5    # 404
 readonly APIARY_ERR_CONFLICT=6     # 409
 readonly APIARY_ERR_DEPS=7         # missing dependencies
+readonly APIARY_ERR_RATE_LIMIT=8   # 429
+
+# Rate-limit retry-after value (set by _apiary_request on 429 responses)
+_APIARY_RETRY_AFTER=""
 
 # ── Dependency check ─────────────────────────────────────────────
 apiary_check_deps() {
@@ -66,6 +70,7 @@ _apiary_exit_code() {
         404)         echo $APIARY_ERR_NOT_FOUND ;;
         409)         echo $APIARY_ERR_CONFLICT ;;
         422)         echo $APIARY_ERR_VALIDATION ;;
+        429)         echo $APIARY_ERR_RATE_LIMIT ;;
         *)           echo $APIARY_ERR ;;
     esac
 }
@@ -80,11 +85,18 @@ _apiary_request() {
     local url="${APIARY_BASE_URL:?APIARY_BASE_URL must be set}${path}"
     local timeout="${APIARY_TIMEOUT:-30}"
 
+    local _header_file
+    _header_file=$(mktemp "${TMPDIR:-/tmp}/apiary-sdk-headers.XXXXXXXXXX") || {
+        _apiary_err "failed to create temp file for response headers"
+        return $APIARY_ERR
+    }
+
     local -a curl_args=(
         --silent
         --show-error
         --max-time "$timeout"
         --write-out '\n%{http_code}'
+        -D "$_header_file"
         -H 'Accept: application/json'
     )
 
@@ -105,8 +117,18 @@ _apiary_request() {
     local raw_output
     raw_output=$(curl -X "$method" "${curl_args[@]}" "$url" 2>&${_apiary_debug_fd:-2}) || {
         _apiary_err "curl failed (network error or timeout)"
+        rm -f "$_header_file" 2>/dev/null || true
         return $APIARY_ERR
     }
+
+    # Extract Retry-After header for rate-limit handling
+    _APIARY_RETRY_AFTER=""
+    local _ra_line
+    _ra_line=$(grep -i '^retry-after:' "$_header_file" 2>/dev/null | head -1) || true
+    if [[ -n "${_ra_line:-}" ]]; then
+        _APIARY_RETRY_AFTER=$(echo "$_ra_line" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+    fi
+    rm -f "$_header_file" 2>/dev/null || true
 
     # Split response: last line is HTTP status code
     local http_status

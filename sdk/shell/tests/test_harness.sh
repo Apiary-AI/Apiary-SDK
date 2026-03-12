@@ -132,21 +132,31 @@ test_summary() {
 # Captured args are written to temp files to survive subshell boundaries.
 
 declare -gA _MOCK_RESPONSES=()
+declare -gA _MOCK_RESPONSE_HEADERS=()
 
 mock_response() {
     local method="$1" path="$2" status="$3" body="${4:-}"
     _MOCK_RESPONSES["${method} ${path}"]="${status}|${body}"
 }
 
+# mock_response_headers METHOD PATH HEADER_LINES
+#   Register response headers for a mock endpoint.
+#   HEADER_LINES should be newline-separated "Header: value" strings.
+mock_response_headers() {
+    local method="$1" path="$2" header_lines="$3"
+    _MOCK_RESPONSE_HEADERS["${method} ${path}"]="$header_lines"
+}
+
 mock_reset() {
     _MOCK_RESPONSES=()
+    _MOCK_RESPONSE_HEADERS=()
     rm -f "${_MOCK_DIR}/args" "${_MOCK_DIR}/body" "${_MOCK_DIR}/method" \
           "${_MOCK_DIR}/url" "${_MOCK_DIR}/headers" "${_MOCK_DIR}/url_log"
 }
 
 # Override curl for testing — writes capture data to temp files
 curl() {
-    local method="GET" url="" body=""
+    local method="GET" url="" body="" dump_header_file=""
     local -a headers=()
     local -a all_args=("$@")
 
@@ -168,6 +178,10 @@ curl() {
             -H)
                 ((i++))
                 headers+=("${all_args[$i]}")
+                ;;
+            -D)
+                ((i++))
+                dump_header_file="${all_args[$i]}"
                 ;;
             --silent|--show-error|--verbose) ;;
             --max-time|--write-out)
@@ -199,6 +213,14 @@ curl() {
         local entry="${_MOCK_RESPONSES[$key]}"
         local status="${entry%%|*}"
         local resp_body="${entry#*|}"
+        # Write mock response headers to dump file if -D was used
+        if [[ -n "$dump_header_file" ]]; then
+            printf 'HTTP/1.1 %s\r\n' "$status" > "$dump_header_file"
+            if [[ -v "_MOCK_RESPONSE_HEADERS[$key]" ]]; then
+                printf '%s\r\n' "${_MOCK_RESPONSE_HEADERS[$key]}" >> "$dump_header_file"
+            fi
+            printf '\r\n' >> "$dump_header_file"
+        fi
         if [[ -n "$resp_body" ]]; then
             printf '%s' "$resp_body"
         fi
@@ -207,6 +229,9 @@ curl() {
     fi
 
     # Default: 404
+    if [[ -n "$dump_header_file" ]]; then
+        printf 'HTTP/1.1 404\r\n\r\n' > "$dump_header_file"
+    fi
     printf '{"data":null,"meta":{},"errors":[{"message":"Not found","code":"not_found"}]}\n404'
     return 0
 }
