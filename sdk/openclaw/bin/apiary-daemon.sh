@@ -208,6 +208,41 @@ _daemon_process_routed_task() {
     fi
 }
 
+# _daemon_event_is_exec_ready EVENT_JSON — Check if event has execution-ready invoke fields.
+# Returns 0 (true) when the event carries top-level invoke.instructions,
+# meaning the daemon can dispatch without a follow-up detail fetch.
+_daemon_event_is_exec_ready() {
+    local event_json="$1"
+    local instructions
+    instructions=$(echo "$event_json" | jq -r '.invoke.instructions // empty' 2>/dev/null) || instructions=""
+    [[ -n "$instructions" ]]
+}
+
+# _daemon_build_event_dispatch_text — Build dispatch text for OpenClaw system event.
+# For execution-ready events, includes invoke instructions/context inline.
+# For legacy events, returns the reference-only text.
+_daemon_build_event_dispatch_text() {
+    local event_json="$1"
+    local event_type="$2"
+    local event_id="$3"
+
+    local text="apiary:event:${event_type}:${event_id}"
+
+    local instructions
+    instructions=$(echo "$event_json" | jq -r '.invoke.instructions // empty' 2>/dev/null) || instructions=""
+    if [[ -n "$instructions" ]]; then
+        text+=$'\n'"invoke.instructions: ${instructions}"
+
+        local context
+        context=$(echo "$event_json" | jq -c '.invoke.context // null' 2>/dev/null) || context="null"
+        if [[ "$context" != "null" ]]; then
+            text+=$'\n'"invoke.context: ${context}"
+        fi
+    fi
+
+    echo "$text"
+}
+
 _daemon_process_polled_events() {
     local hive_id="${APIARY_HIVE_ID:-}"
     [[ -n "$hive_id" ]] || return 0
@@ -228,23 +263,42 @@ _daemon_process_polled_events() {
 
         [[ -n "$event_id" ]] || continue
 
-        _daemon_save_pending_event "$event_json"
-        echo "[apiary-daemon] New event: ${event_id} (type: ${event_type})" >&2
+        # Execution-ready events carry invoke.instructions at top level;
+        # skip saving a pending snapshot when the dispatch text already
+        # contains all the data the consumer needs.
+        local exec_ready=0
+        if _daemon_event_is_exec_ready "$event_json"; then
+            exec_ready=1
+            echo "[apiary-daemon] New event (exec-ready): ${event_id} (type: ${event_type})" >&2
+        else
+            _daemon_save_pending_event "$event_json"
+            echo "[apiary-daemon] New event: ${event_id} (type: ${event_type})" >&2
+        fi
 
         local dispatch_ok=1
+        local dispatch_text
+        dispatch_text=$(_daemon_build_event_dispatch_text "$event_json" "$event_type" "$event_id")
 
         # Notify OpenClaw via system event.
         # If dispatch fails (including missing CLI), do NOT advance cursor
         # and do NOT prune snapshot.
         if command -v openclaw >/dev/null 2>&1; then
             if ! openclaw system event \
-                --text "apiary:event:${event_type}:${event_id}" \
+                --text "$dispatch_text" \
                 --mode now 2>/dev/null; then
                 dispatch_ok=0
+                # On dispatch failure, ensure pending is saved for retry
+                # even if we skipped it earlier (exec-ready path).
+                if [[ $exec_ready -eq 1 ]]; then
+                    _daemon_save_pending_event "$event_json"
+                fi
                 echo "[apiary-daemon] Event dispatch failed for ${event_id}; preserving snapshot for retry" >&2
             fi
         else
             dispatch_ok=0
+            if [[ $exec_ready -eq 1 ]]; then
+                _daemon_save_pending_event "$event_json"
+            fi
             echo "[apiary-daemon] openclaw command not found; preserving event ${event_id} for retry" >&2
         fi
 
