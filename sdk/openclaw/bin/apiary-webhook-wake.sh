@@ -78,6 +78,8 @@ _WAKE_ALERT_ENABLED="${APIARY_WAKE_ALERT_ENABLED:-false}"
 _WAKE_ALERT_TELEGRAM="${APIARY_WAKE_ALERT_TELEGRAM:-}"
 _WAKE_ALERT_CHANNEL="${APIARY_WAKE_ALERT_CHANNEL:-telegram}"
 _WAKE_CLI_TIMEOUT="${APIARY_WAKE_CLI_TIMEOUT:-30}"
+_WAKE_REMINDER_SEND_TIMEOUT="${APIARY_REMINDER_SEND_TIMEOUT:-60}"
+_WAKE_LAST_ERROR=""
 
 # ── Logging ────────────────────────────────────────────────────
 
@@ -401,23 +403,26 @@ _wake_send_alert_cli() {
     local target="$1"
     local channel="$2"
     local message="$3"
+    local send_timeout="${4:-$_WAKE_CLI_TIMEOUT}"
 
     if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
         _wake_validate_cli >/dev/null 2>&1 || true
     fi
 
     if [[ "${_WAKE_CLI_AVAILABLE:-0}" -ne 1 ]]; then
+        _WAKE_LAST_ERROR="CLI transport not available for alerts"
         _wake_log "ERROR" "CLI transport requested but openclaw CLI is not available for alerts"
         return 1
     fi
 
     local output
-    output=$(timeout "$_WAKE_CLI_TIMEOUT" openclaw message send \
+    output=$(timeout "$send_timeout" openclaw message send \
         --channel "$channel" \
         --target "$target" \
         --message "$message" \
         2>&1) || {
         local rc=$?
+        _WAKE_LAST_ERROR="openclaw message send rc=${rc}: ${output:-<no output>}"
         _wake_log "ERROR" "openclaw message send failed (rc=${rc}) channel=${channel} target=${target}: ${output:-<no output>}"
         return 1
     }
@@ -432,8 +437,10 @@ _wake_send_alert_gateway() {
     local target="$1"
     local channel="$2"
     local message="$3"
+    local send_timeout="${4:-$_WAKE_GATEWAY_TIMEOUT}"
 
     if ! command -v curl >/dev/null 2>&1; then
+        _WAKE_LAST_ERROR="curl not found; alert gateway unavailable"
         _wake_log "ERROR" "curl not found; alert gateway unavailable — install curl to enable alerts"
         return 1
     fi
@@ -444,7 +451,7 @@ _wake_send_alert_gateway() {
         -s -S
         -X POST
         -H "Content-Type: application/json"
-        --max-time "$_WAKE_GATEWAY_TIMEOUT"
+        --max-time "$send_timeout"
         --connect-timeout "$_WAKE_GATEWAY_TIMEOUT"
     )
     if [[ -n "$_WAKE_GATEWAY_TOKEN" ]]; then
@@ -458,6 +465,7 @@ _wake_send_alert_gateway() {
 
     local http_code
     http_code=$(curl "${curl_args[@]}" -o /dev/null -w '%{http_code}' -d "$body" "$url" 2>/dev/null) || {
+        _WAKE_LAST_ERROR="alert gateway curl error for ${url}"
         _wake_log "ERROR" "alert gateway request failed (curl error) url=${url}"
         return 1
     }
@@ -466,6 +474,7 @@ _wake_send_alert_gateway() {
         return 0
     fi
 
+    _WAKE_LAST_ERROR="alert gateway HTTP ${http_code}"
     _wake_log "ERROR" "alert gateway returned HTTP ${http_code} for ${url}"
     return 1
 }
@@ -478,16 +487,20 @@ _wake_send_alert() {
     local target="$1"
     local channel="$2"
     local message="$3"
+    local send_timeout="${4:-}"
+
+    _WAKE_LAST_ERROR=""
 
     if [[ "${_WAKE_TRANSPORT_INVALID:-0}" -eq 1 ]]; then
+        _WAKE_LAST_ERROR="Invalid wake transport configuration"
         _wake_log "ERROR" "Invalid wake transport configuration; refusing to dispatch alert"
         return 1
     fi
 
     if [[ "$_WAKE_TRANSPORT" == "gateway" ]]; then
-        _wake_send_alert_gateway "$target" "$channel" "$message"
+        _wake_send_alert_gateway "$target" "$channel" "$message" "${send_timeout:-$_WAKE_GATEWAY_TIMEOUT}"
     else
-        _wake_send_alert_cli "$target" "$channel" "$message"
+        _wake_send_alert_cli "$target" "$channel" "$message" "${send_timeout:-$_WAKE_CLI_TIMEOUT}"
     fi
 }
 
