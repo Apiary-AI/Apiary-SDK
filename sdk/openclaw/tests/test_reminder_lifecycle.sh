@@ -39,6 +39,8 @@ _setup() {
     rm -f "${PENDING_DIR}"/*.json 2>/dev/null || true
     rm -f "${PENDING_DIR}"/*.claimed 2>/dev/null || true
     rm -f "${PENDING_DIR}"/*.delivered 2>/dev/null || true
+    rm -f "${PENDING_DIR}"/*.retry_count 2>/dev/null || true
+    rm -f "${PENDING_DIR}"/*.retry_after 2>/dev/null || true
     rm -rf "${PENDING_DIR}/quarantine" 2>/dev/null || true
     rm -rf "${_tmp_dir}/traces"
 
@@ -103,6 +105,7 @@ _setup() {
         echo "${1:-}" > "${_MOCK_DIR}/send_last_target"
         echo "${2:-}" > "${_MOCK_DIR}/send_last_channel"
         echo "${3:-}" > "${_MOCK_DIR}/send_last_message"
+        echo "${4:-}" > "${_MOCK_DIR}/send_last_timeout"
         return $_SEND_RC
     }
 
@@ -1165,6 +1168,220 @@ assert_eq "$([ -f "${PENDING_DIR}/rem-fail-409.json" ] && echo exists || echo re
     "fail-409: pending file cleaned up"
 assert_eq "$([ -f "${PENDING_DIR}/rem-fail-409.result.json" ] && echo exists || echo removed)" "removed" \
     "fail-409: no result artifact saved"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Delivery stderr/detail propagated into fail payload
+# ═══════════════════════════════════════════════════════════════
+
+describe "Delivery failure — stderr detail propagated to fail payload"
+
+_setup
+
+# Override mock to set _WAKE_LAST_ERROR on failure (simulates real transport)
+_wake_send_alert() {
+    local n; n=$(cat "${_MOCK_DIR}/send_calls"); echo $(( n + 1 )) > "${_MOCK_DIR}/send_calls"
+    echo "${1:-}" > "${_MOCK_DIR}/send_last_target"
+    echo "${2:-}" > "${_MOCK_DIR}/send_last_channel"
+    echo "${3:-}" > "${_MOCK_DIR}/send_last_message"
+    echo "${4:-}" > "${_MOCK_DIR}/send_last_timeout"
+    _WAKE_LAST_ERROR="openclaw message send rc=124: connection timed out"
+    return 1
+}
+
+task_json=$(_make_reminder_task "rem-stderr" "telegram" "42" "Stderr test")
+echo "$task_json" > "${PENDING_DIR}/rem-stderr.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-stderr"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "stderr: returns 0"
+assert_eq "$(_mock_read_n fail_calls)" "1" "stderr: fail called"
+assert_contains "$(_mock_read fail_last_error)" "rc=124" "stderr: fail payload includes return code detail"
+assert_contains "$(_mock_read fail_last_error)" "timed out" "stderr: fail payload includes timeout detail"
+assert_contains "$(_mock_read fail_last_error)" "delivery_detail" "stderr: result JSON includes delivery_detail field"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Delivery failure without _WAKE_LAST_ERROR falls back to generic summary
+# ═══════════════════════════════════════════════════════════════
+
+describe "Delivery failure — fallback summary when no stderr detail"
+
+_setup
+_SEND_RC=1
+
+task_json=$(_make_reminder_task "rem-no-stderr" "telegram" "42" "No stderr")
+echo "$task_json" > "${PENDING_DIR}/rem-no-stderr.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-no-stderr"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "no-stderr: returns 0"
+assert_eq "$(_mock_read_n fail_calls)" "1" "no-stderr: fail called"
+assert_contains "$(_mock_read fail_last_error)" "delivery failed" "no-stderr: fail payload includes generic delivery error"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Reminder uses configured send timeout (default 60s)
+# ═══════════════════════════════════════════════════════════════
+
+describe "Reminder — uses default reminder send timeout (60s)"
+
+_setup
+task_json=$(_make_reminder_task "rem-timeout-default" "telegram" "42" "Timeout default")
+echo "$task_json" > "${PENDING_DIR}/rem-timeout-default.json"
+
+_lifecycle_process_reminder "$task_json" "rem-timeout-default"
+
+assert_eq "$(_mock_read send_last_timeout)" "60" "timeout-default: delivery called with 60s timeout"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Reminder send timeout is configurable via env
+# ═══════════════════════════════════════════════════════════════
+
+describe "Reminder — uses custom send timeout from env"
+
+_setup
+_WAKE_REMINDER_SEND_TIMEOUT=90
+
+task_json=$(_make_reminder_task "rem-timeout-custom" "telegram" "42" "Timeout custom")
+echo "$task_json" > "${PENDING_DIR}/rem-timeout-custom.json"
+
+_lifecycle_process_reminder "$task_json" "rem-timeout-custom"
+
+assert_eq "$(_mock_read send_last_timeout)" "90" "timeout-custom: delivery called with 90s timeout"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Retry backoff — skips tasks in backoff window
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry backoff — skips tasks in backoff window"
+
+_setup
+reminder_task=$(_make_reminder_task "rem-backoff" "telegram" "999" "Backoff test")
+echo "$reminder_task" > "${PENDING_DIR}/rem-backoff.json"
+
+# Write a retry_after in the future (1 hour from now)
+future_ts=$(( $(date +%s) + 3600 ))
+echo "$future_ts" > "${PENDING_DIR}/rem-backoff.retry_after"
+echo "1" > "${PENDING_DIR}/rem-backoff.retry_count"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$(_mock_read_n claim_calls)" "0" "backoff: task not attempted during backoff window"
+assert_eq "$([ -f "${PENDING_DIR}/rem-backoff.json" ] && echo exists || echo removed)" "exists" \
+    "backoff: pending file preserved"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Retry backoff — expired backoff allows processing
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry backoff — expired backoff allows processing"
+
+_setup
+reminder_task=$(_make_reminder_task "rem-backoff-expired" "telegram" "999" "Backoff expired")
+echo "$reminder_task" > "${PENDING_DIR}/rem-backoff-expired.json"
+
+# Write an expired retry_after (1 hour ago)
+past_ts=$(( $(date +%s) - 3600 ))
+echo "$past_ts" > "${PENDING_DIR}/rem-backoff-expired.retry_after"
+echo "1" > "${PENDING_DIR}/rem-backoff-expired.retry_count"
+
+_lifecycle_retry_pending_handlers
+
+assert_eq "$(_mock_read_n claim_calls)" "1" "backoff-expired: task attempted after backoff expires"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Retry backoff — written on transient API failure
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry backoff — written on transient API failure"
+
+_setup
+_COMPLETE_RC=1  # API failure
+task_json=$(_make_reminder_task "rem-backoff-write" "telegram" "42" "Backoff write")
+echo "$task_json" > "${PENDING_DIR}/rem-backoff-write.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-backoff-write"
+rc=$?
+set -e
+
+assert_eq "$rc" "1" "backoff-write: returns 1 (retryable)"
+assert_eq "$([ -f "${PENDING_DIR}/rem-backoff-write.retry_count" ] && echo exists || echo missing)" "exists" \
+    "backoff-write: retry_count written"
+assert_eq "$([ -f "${PENDING_DIR}/rem-backoff-write.retry_after" ] && echo exists || echo missing)" "exists" \
+    "backoff-write: retry_after written"
+assert_eq "$(cat "${PENDING_DIR}/rem-backoff-write.retry_count")" "1" "backoff-write: retry_count is 1"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Retry backoff — increments on repeated failures
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry backoff — increments on repeated transient failures"
+
+_setup
+_COMPLETE_RC=1  # API failure
+task_json=$(_make_reminder_task "rem-backoff-incr" "telegram" "42" "Backoff incr")
+echo "$task_json" > "${PENDING_DIR}/rem-backoff-incr.json"
+
+# First failure
+set +e
+_lifecycle_process_reminder "$task_json" "rem-backoff-incr"
+set -e
+
+first_count=$(cat "${PENDING_DIR}/rem-backoff-incr.retry_count")
+first_after=$(cat "${PENDING_DIR}/rem-backoff-incr.retry_after")
+
+# Reset artifact for second attempt (re-create pending file)
+echo "$task_json" > "${PENDING_DIR}/rem-backoff-incr.json"
+# Override to bypass result artifact (simulate fresh attempt)
+rm -f "${PENDING_DIR}/rem-backoff-incr.result.json"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-backoff-incr"
+set -e
+
+second_count=$(cat "${PENDING_DIR}/rem-backoff-incr.retry_count")
+
+assert_eq "$first_count" "1" "backoff-incr: first failure count is 1"
+assert_eq "$second_count" "2" "backoff-incr: second failure count is 2"
+
+
+# ═══════════════════════════════════════════════════════════════
+# P4: Retry backoff — cleared on success
+# ═══════════════════════════════════════════════════════════════
+
+describe "Retry backoff — cleared on success"
+
+_setup
+task_json=$(_make_reminder_task "rem-backoff-clear" "telegram" "42" "Backoff clear")
+echo "$task_json" > "${PENDING_DIR}/rem-backoff-clear.json"
+
+# Write stale backoff markers (already expired)
+echo "3" > "${PENDING_DIR}/rem-backoff-clear.retry_count"
+echo "0" > "${PENDING_DIR}/rem-backoff-clear.retry_after"
+
+set +e
+_lifecycle_process_reminder "$task_json" "rem-backoff-clear"
+rc=$?
+set -e
+
+assert_eq "$rc" "0" "backoff-clear: returns 0"
+assert_eq "$([ -f "${PENDING_DIR}/rem-backoff-clear.retry_count" ] && echo exists || echo removed)" "removed" \
+    "backoff-clear: retry_count cleaned up"
+assert_eq "$([ -f "${PENDING_DIR}/rem-backoff-clear.retry_after" ] && echo exists || echo removed)" "removed" \
+    "backoff-clear: retry_after cleaned up"
 
 
 test_summary
