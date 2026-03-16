@@ -62,6 +62,59 @@ _lifecycle_parse_409_status() {
     ' 2>/dev/null | head -n1
 }
 
+# ── Retry backoff helpers ────────────────────────────────────
+
+# Check if a task should be skipped due to retry backoff.
+# Returns 0 if the task can proceed, 1 if it should wait.
+_lifecycle_check_retry_backoff() {
+    local pending_dir="$1"
+    local task_id="$2"
+
+    local retry_after_file="${pending_dir}/${task_id}.retry_after"
+    [[ -f "$retry_after_file" ]] || return 0
+
+    local retry_after now
+    retry_after=$(cat "$retry_after_file" 2>/dev/null) || return 0
+    now=$(date +%s 2>/dev/null) || return 0
+
+    if [[ $now -lt $retry_after ]]; then
+        return 1  # still in backoff window
+    fi
+    return 0
+}
+
+# Write a retry backoff marker with exponential delay.
+# Delay: 5 * 2^(attempt-1), capped at 120s.
+_lifecycle_write_retry_backoff() {
+    local pending_dir="$1"
+    local task_id="$2"
+
+    local count_file="${pending_dir}/${task_id}.retry_count"
+    local after_file="${pending_dir}/${task_id}.retry_after"
+
+    local count
+    count=$(cat "$count_file" 2>/dev/null) || count=0
+    count=$(( count + 1 ))
+    echo "$count" > "$count_file" 2>/dev/null || true
+
+    # Exponential backoff: 5 * 2^(count-1), capped at 120s
+    local delay=$(( 5 * (1 << (count - 1)) ))
+    [[ $delay -gt 120 ]] && delay=120
+
+    local now
+    now=$(date +%s 2>/dev/null) || return 0
+    echo $(( now + delay )) > "$after_file" 2>/dev/null || true
+}
+
+# Clean up retry backoff markers.
+_lifecycle_clear_retry_backoff() {
+    local pending_dir="$1"
+    local task_id="$2"
+
+    rm -f "${pending_dir}/${task_id}.retry_count"
+    rm -f "${pending_dir}/${task_id}.retry_after"
+}
+
 # ── Trace persistence ─────────────────────────────────────────
 
 # Write a trace record for audit/debugging.
@@ -641,6 +694,7 @@ _lifecycle_process_reminder() {
             rm -f "${pending_dir}/${task_id}.json"
             rm -f "${pending_dir}/${task_id}.claimed"
             rm -f "${pending_dir}/${task_id}.delivered"
+            _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
             return 0
         elif [[ $api_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
             local remote_status
@@ -660,10 +714,12 @@ _lifecycle_process_reminder() {
             rm -f "${pending_dir}/${task_id}.json"
             rm -f "${pending_dir}/${task_id}.claimed"
             rm -f "${pending_dir}/${task_id}.delivered"
+            _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
             return 0
         fi
 
         _wake_log "WARN" "lifecycle: reminder terminal API retry still failing for task ${task_id}; preserving"
+        _lifecycle_write_retry_backoff "$pending_dir" "$task_id"
         return 1
     fi
 
@@ -720,6 +776,7 @@ _lifecycle_process_reminder() {
             rm -f "${pending_dir}/${task_id}.json"
             rm -f "${pending_dir}/${task_id}.claimed"
             rm -f "$delivered_marker"
+            _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
             return 0
         fi
 
@@ -744,6 +801,7 @@ _lifecycle_process_reminder() {
                 rm -f "${pending_dir}/${task_id}.json"
                 rm -f "${pending_dir}/${task_id}.claimed"
                 rm -f "$delivered_marker"
+                _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
                 return 0
             elif [[ $reconcile_rc -eq ${APIARY_ERR_CONFLICT:-6} ]]; then
                 local remote_status
@@ -759,10 +817,12 @@ _lifecycle_process_reminder() {
                 rm -f "${pending_dir}/${task_id}.json"
                 rm -f "${pending_dir}/${task_id}.claimed"
                 rm -f "$delivered_marker"
+                _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
                 return 0
             else
                 _wake_log "WARN" "lifecycle: reminder task ${task_id} reconciliation API failed; saving artifact"
                 echo "$reconcile_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+                _lifecycle_write_retry_backoff "$pending_dir" "$task_id"
                 return 1
             fi
         fi
@@ -784,6 +844,7 @@ _lifecycle_process_reminder() {
                 _lifecycle_write_trace "$task_id" "$remote_trace"
                 rm -f "${pending_dir}/${task_id}.json"
                 rm -f "${pending_dir}/${task_id}.claimed"
+                _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
                 return 0
             fi
         fi
@@ -813,16 +874,21 @@ _lifecycle_process_reminder() {
             process_summary="validation failed: payload requires non-empty channel, target, and message"
             _wake_log "WARN" "lifecycle: reminder validation failed for ${task_id} (channel='${channel}' target='${target}' message_len=${#reminder_message})"
         else
-            if _wake_send_alert "$target" "$channel" "$reminder_message"; then
+            if _wake_send_alert "$target" "$channel" "$reminder_message" "${_WAKE_REMINDER_SEND_TIMEOUT:-60}"; then
                 process_summary="delivered reminder via ${channel} to ${target}"
                 # Write delivery evidence for crash recovery idempotency.
                 # Step 1b checks this marker to avoid duplicate re-sends.
                 echo "$task_id" > "${pending_dir}/${task_id}.delivered" 2>/dev/null || true
                 _wake_log "INFO" "lifecycle: reminder delivered for ${task_id} via channel=${channel} target=${target}"
             else
+                local delivery_detail="${_WAKE_LAST_ERROR:-}"
                 process_status="failed"
-                process_summary="delivery failed: message.send channel=${channel} target=${target}"
-                _wake_log "WARN" "lifecycle: reminder delivery failed for ${task_id} via channel=${channel} target=${target}"
+                if [[ -n "$delivery_detail" ]]; then
+                    process_summary="delivery failed: ${delivery_detail}"
+                else
+                    process_summary="delivery failed: message.send channel=${channel} target=${target}"
+                fi
+                _wake_log "WARN" "lifecycle: reminder delivery failed for ${task_id} via channel=${channel} target=${target}: ${delivery_detail:-unknown}"
             fi
         fi
     fi
@@ -863,16 +929,19 @@ _lifecycle_process_reminder() {
         else
             _wake_log "WARN" "lifecycle: reminder task ${task_id} processed but completion API call failed; saving result artifact for retry"
             echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            _lifecycle_write_retry_backoff "$pending_dir" "$task_id"
             return 1
         fi
     else
+        local fail_detail="${_WAKE_LAST_ERROR:-}"
         result_json=$(jq -n \
             --arg id "$task_id" \
             --arg err "$process_summary" \
             --arg ch "$channel" \
             --arg tgt "$target" \
+            --arg detail "$fail_detail" \
             --arg ts "$now_ts" \
-            '{"task_id":$id,"status":"failed","error":$err,"delivery":{"channel":$ch,"target":$tgt},"failed_at":$ts}' \
+            '{"task_id":$id,"status":"failed","error":$err,"delivery":{"channel":$ch,"target":$tgt},"failed_at":$ts} + (if $detail != "" then {"delivery_detail":$detail} else {} end)' \
             2>/dev/null) || result_json="{\"task_id\":\"${task_id}\",\"status\":\"failed\"}"
 
         local fail_rc=0 fail_body=""
@@ -887,6 +956,7 @@ _lifecycle_process_reminder() {
         else
             _wake_log "WARN" "lifecycle: reminder task ${task_id} fail API call failed; saving result artifact for retry"
             echo "$result_json" > "${pending_dir}/${task_id}.result.json" 2>/dev/null || true
+            _lifecycle_write_retry_backoff "$pending_dir" "$task_id"
             return 1
         fi
     fi
@@ -899,6 +969,7 @@ _lifecycle_process_reminder() {
     rm -f "${pending_dir}/${task_id}.result.json"
     rm -f "${pending_dir}/${task_id}.claimed"
     rm -f "${pending_dir}/${task_id}.delivered"
+    _lifecycle_clear_retry_backoff "$pending_dir" "$task_id"
 
     return 0
 }
@@ -926,6 +997,11 @@ _lifecycle_retry_pending_handlers() {
         ptask_id=$(basename "$pending_file" .json)
         ptask_type=$(echo "$ptask_json" | jq -r '.type // empty' 2>/dev/null) || ptask_type=""
         [[ -z "$ptask_type" ]] && continue
+
+        # Skip tasks still in retry backoff window
+        if ! _lifecycle_check_retry_backoff "$pending_dir" "$ptask_id"; then
+            continue
+        fi
 
         _lifecycle_process_routed_task "$ptask_json" "$ptask_id" "$ptask_type" || true
 
