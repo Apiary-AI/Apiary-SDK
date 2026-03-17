@@ -163,7 +163,7 @@ Each version is a **complete snapshot** — all documents + config at that point
   "performance": {
     "tasks_completed": 45,
     "avg_rating": 4.2,
-    "avg_completion_time": 38
+    "avg_task_duration": 38
   }
 }
 ```
@@ -237,13 +237,15 @@ GET /api/v1/tasks/poll
 Agent SDK compares with cached version. If different:
 
 ```python
-# Automatic in SDK poll loop
+# Automatic in SDK poll loop — respects agent's update policy
+# server_persona_version = the version the server says THIS agent should use
+# (active version for auto, pinned version for manual, canary-assigned for staged)
 if server_persona_version != cached_version:
     client.persona.refresh()
     # Next LLM call uses new persona
 ```
 
-No restart. No redeploy. Prompt change in dashboard → agent behavior changes within one poll cycle (3-5 seconds).
+No restart. No redeploy. The server returns the policy-correct version for each agent in the poll response: the active version for `auto` agents, the pinned version for `manual` agents, or the canary-assigned version for `staged` agents (see §5.2). When a `manual` agent is explicitly promoted to a new version, the poll response reflects the change and the SDK refreshes on the next cycle.
 
 ### 5.2 Lock Mechanism
 
@@ -320,14 +322,14 @@ GET /api/v1/agents/{id}/persona/ab-test/results
   "variant_a": {
     "version": 7,
     "tasks_completed": 45,
-    "avg_duration_seconds": 38,
+    "avg_task_duration": 38,
     "error_rate": 0.02,
     "human_ratings": { "avg": 4.2, "count": 12 }
   },
   "variant_b": {
     "version": 8,
     "tasks_completed": 42,
-    "avg_duration_seconds": 41,
+    "avg_task_duration": 41,
     "error_rate": 0.01,
     "human_ratings": { "avg": 4.6, "count": 11 }
   },
@@ -586,10 +588,11 @@ POST   /api/v1/agents/{id}/persona/from-template — Create persona from templat
 ### 9.5 Agent SDK Endpoint
 
 ```
-GET    /api/v1/persona                          — Get MY persona (agent auth, returns active version)
+GET    /api/v1/persona                          — Get MY persona (agent auth, returns policy-selected version: active for auto, pinned for manual, canary-assigned for staged)
 GET    /api/v1/persona/config                   — Get config only
-GET    /api/v1/persona/document/{name}          — Get single document
+GET    /api/v1/persona/documents/{name}         — Get single document
 GET    /api/v1/persona/assembled                — Get pre-assembled system prompt string
+PATCH  /api/v1/persona/documents/{name}         — Update single document (agent self-update, respects lock policy)
 ```
 
 ### 9.6 Update Persona (Full Example)
@@ -684,8 +687,8 @@ Locked documents: API returns 403 if agent tries to modify a locked document. Hu
 CREATE TABLE agent_personas (
     id              VARCHAR(26) PRIMARY KEY,
     agent_id        VARCHAR(26) NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-    apiary_id       VARCHAR(26) NOT NULL,
-    hive_id         VARCHAR(26) NOT NULL,
+    apiary_id       VARCHAR(26) NOT NULL REFERENCES apiaries(id) ON DELETE CASCADE,
+    hive_id         VARCHAR(26) NOT NULL REFERENCES hives(id) ON DELETE CASCADE,
     
     version         INTEGER NOT NULL,
     is_active       BOOLEAN DEFAULT FALSE,
@@ -717,7 +720,7 @@ CREATE TABLE agent_personas (
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_persona_active ON agent_personas (agent_id, is_active)
+CREATE UNIQUE INDEX idx_persona_active ON agent_personas (agent_id)
     WHERE is_active = TRUE;
 CREATE INDEX idx_persona_versions ON agent_personas (agent_id, version DESC);
 CREATE UNIQUE INDEX idx_persona_version_unique ON agent_personas (agent_id, version);
@@ -727,9 +730,12 @@ CREATE TABLE persona_ab_tests (
     id              VARCHAR(26) PRIMARY KEY,
     agent_id        VARCHAR(26) NOT NULL REFERENCES agents(id),
     
-    variant_a       INTEGER NOT NULL,        -- persona version
-    variant_b       INTEGER NOT NULL,        -- persona version
-    split           SMALLINT DEFAULT 50,     -- percentage for variant A
+    variant_a       INTEGER NOT NULL,        -- persona version (validated by app against agent_personas)
+    variant_b       INTEGER NOT NULL,        -- persona version (validated by app against agent_personas)
+    CONSTRAINT fk_variant_a FOREIGN KEY (agent_id, variant_a) REFERENCES agent_personas(agent_id, version),
+    CONSTRAINT fk_variant_b FOREIGN KEY (agent_id, variant_b) REFERENCES agent_personas(agent_id, version),
+    CONSTRAINT chk_distinct_variants CHECK (variant_a <> variant_b),
+    split           SMALLINT DEFAULT 50 CHECK (split BETWEEN 0 AND 100),
     
     status          VARCHAR(20) DEFAULT 'running',  -- running, completed, stopped
     started_at      TIMESTAMP DEFAULT NOW(),
@@ -750,6 +756,10 @@ Agents table addition:
 ALTER TABLE agents ADD COLUMN persona_version INTEGER;
 ALTER TABLE agents ADD COLUMN persona_update_policy VARCHAR(20) DEFAULT 'auto';
 ALTER TABLE agents ADD COLUMN persona_pinned_version INTEGER;
+-- Integrity note: persona_version and persona_pinned_version logically reference
+-- agent_personas(agent_id, version) but a composite FK here would create a circular
+-- dependency (agents ↔ agent_personas). Validity is enforced by PersonaService which
+-- verifies the version exists for the agent before writing these columns.
 ```
 
 ---
