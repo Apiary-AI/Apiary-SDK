@@ -601,6 +601,39 @@ class ApiaryClient:
         )
 
     # ------------------------------------------------------------------
+    # Persona
+    # ------------------------------------------------------------------
+
+    def get_persona(self) -> dict[str, Any]:
+        """Get the agent's active persona (policy-selected version)."""
+        return self._request("GET", "/api/v1/persona")
+
+    def get_persona_config(self) -> dict[str, Any]:
+        """Get persona config only."""
+        return self._request("GET", "/api/v1/persona/config")
+
+    def get_persona_document(self, name: str) -> dict[str, Any]:
+        """Get a single persona document by name."""
+        return self._request("GET", f"/api/v1/persona/documents/{name}")
+
+    def get_persona_assembled(self) -> dict[str, Any]:
+        """Get pre-assembled system prompt (SOUL→AGENT→RULES→STYLE→EXAMPLES→MEMORY)."""
+        return self._request("GET", "/api/v1/persona/assembled")
+
+    def update_persona_document(
+        self,
+        name: str,
+        *,
+        content: str,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """Update a single persona document (agent self-update)."""
+        body: dict[str, Any] = {"content": content}
+        if message is not None:
+            body["message"] = message
+        return self._request("PATCH", f"/api/v1/persona/documents/{name}", json=body)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
