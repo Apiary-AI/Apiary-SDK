@@ -15,7 +15,7 @@ echo "=============================="
 
 suites=("$@")
 if [[ ${#suites[@]} -eq 0 ]]; then
-    suites=("client" "agents" "tasks" "knowledge" "schedules" "runner")
+    suites=("client" "agents" "tasks" "knowledge" "schedules" "persona" "runner")
 fi
 
 total_pass=0

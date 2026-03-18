@@ -1070,3 +1070,83 @@ apiary_update_rate_limit() {
 
     _apiary_request PUT "/api/v1/agents/rate-limit" "$body"
 }
+
+# ── Persona ──────────────────────────────────────────────────────
+
+# apiary_get_persona — get the agent's active persona (policy-selected version).
+apiary_get_persona() {
+    _apiary_request GET "/api/v1/persona"
+}
+
+# apiary_get_persona_config — get persona config only (model, temperature, etc.).
+apiary_get_persona_config() {
+    _apiary_request GET "/api/v1/persona/config"
+}
+
+# apiary_get_persona_document — get a single persona document by name.
+#   NAME  (e.g. SOUL, AGENT, RULES, STYLE, EXAMPLES, MEMORY)
+apiary_get_persona_document() {
+    local name="${1:?usage: apiary_get_persona_document NAME}"
+    _apiary_request GET "/api/v1/persona/documents/${name}"
+}
+
+# apiary_get_persona_assembled — get pre-assembled system prompt in canonical order.
+apiary_get_persona_assembled() {
+    _apiary_request GET "/api/v1/persona/assembled"
+}
+
+# apiary_update_persona_document — agent self-update of an unlocked document.
+#   NAME  -c CONTENT  [-m MESSAGE]
+#   Returns 403 if the document is locked by policy.
+apiary_update_persona_document() {
+    local name="${1:?usage: apiary_update_persona_document NAME -c CONTENT [-m MESSAGE]}"
+    shift
+    local content="" message=""
+    local message_set=0
+    local OPTIND OPTARG opt
+    while getopts "c:m:" opt; do
+        case "$opt" in
+            c) content="$OPTARG" ;;
+            m) message="$OPTARG"; message_set=1 ;;
+            *) _apiary_err "update_persona_document: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$content" ]]; then
+        _apiary_err "update_persona_document: -c CONTENT is required"
+        return $APIARY_ERR
+    fi
+
+    # jq is required to build the request body with guaranteed string encoding
+    # AND to parse the response in _apiary_request. Without jq, we must not send
+    # the PATCH at all — the server-side update would succeed (creating a new
+    # persona version) while the response parsing would fail, misleading callers
+    # into retrying and silently creating duplicate versions.
+    if ! jq --version >/dev/null 2>&1; then
+        _apiary_err "update_persona_document: jq is required (install jq and retry)"
+        return $APIARY_ERR_DEPS
+    fi
+
+    # Build JSON body with guaranteed string encoding for content and message.
+    # _apiary_build_json coerces values starting with {, [, true, false, null as
+    # raw JSON, making it unsafe for free-form persona text. Use jq --arg instead,
+    # which always emits values as JSON strings regardless of their content.
+    #
+    # Use message_set flag (not [[ -n "$message" ]]) so that -m '' (explicit
+    # empty string) is included in the body rather than silently dropped.
+    local body
+    if [[ "$message_set" -eq 1 ]]; then
+        body=$(jq -n --arg content "$content" --arg message "$message" \
+            '{content: $content, message: $message}') || {
+            _apiary_err "update_persona_document: failed to build JSON body"
+            return $APIARY_ERR
+        }
+    else
+        body=$(jq -n --arg content "$content" \
+            '{content: $content}') || {
+            _apiary_err "update_persona_document: failed to build JSON body"
+            return $APIARY_ERR
+        }
+    fi
+    _apiary_request PATCH "/api/v1/persona/documents/${name}" "$body"
+}
