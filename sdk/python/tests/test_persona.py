@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from apiary_sdk import ApiaryClient
 
 from .conftest import BASE_URL, TOKEN, envelope
@@ -112,3 +114,94 @@ class TestUpdatePersonaDocument:
         body = json.loads(httpx_mock.get_request().content)
         assert body["content"] == "Bare update."
         assert "message" not in body
+        assert body["mode"] == "replace"
+
+    def test_update_append_mode(self, httpx_mock):
+        doc = {"version": 2, "document": "MEMORY", "content": "old\nnew fact"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_persona_document("MEMORY", content="new fact", mode="append")
+        assert result["content"] == "old\nnew fact"
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["mode"] == "append"
+        assert body["content"] == "new fact"
+
+    def test_update_prepend_mode(self, httpx_mock):
+        doc = {"version": 2, "document": "MEMORY", "content": "preamble\nold"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_persona_document("MEMORY", content="preamble", mode="prepend")
+        assert result["content"] == "preamble\nold"
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["mode"] == "prepend"
+
+    def test_update_invalid_mode_raises(self):
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            with pytest.raises(ValueError, match="Invalid mode"):
+                c.update_persona_document("MEMORY", content="x", mode="overwrite")
+
+
+class TestUpdateMemory:
+    """Tests for the update_memory() convenience method."""
+
+    def test_update_memory_default_mode_is_append(self, httpx_mock):
+        doc = {"version": 2, "document": "MEMORY", "content": "old\nnew fact"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/memory",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_memory(content="new fact")
+        assert result["version"] == 2
+        assert result["document"] == "MEMORY"
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["content"] == "new fact"
+        assert body["mode"] == "append"
+        assert "message" not in body
+
+    def test_update_memory_with_message(self, httpx_mock):
+        doc = {"version": 2, "document": "MEMORY", "content": "old\nnew fact"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/memory",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_memory(content="new fact", message="schema discovery")
+        assert result["version"] == 2
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["message"] == "schema discovery"
+
+    def test_update_memory_replace_mode(self, httpx_mock):
+        doc = {"version": 3, "document": "MEMORY", "content": "fresh slate"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/memory",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_memory(content="fresh slate", mode="replace")
+        assert result["content"] == "fresh slate"
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["mode"] == "replace"
+
+    def test_update_memory_prepend_mode(self, httpx_mock):
+        doc = {"version": 4, "document": "MEMORY", "content": "preamble\nold"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/memory",
+            json=envelope(doc),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.update_memory(content="preamble", mode="prepend")
+        assert result["content"] == "preamble\nold"
+        body = json.loads(httpx_mock.get_request().content)
+        assert body["mode"] == "prepend"
+
+    def test_update_memory_invalid_mode_raises(self):
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            with pytest.raises(ValueError, match="Invalid mode"):
+                c.update_memory(content="x", mode="overwrite")

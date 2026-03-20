@@ -626,12 +626,53 @@ class ApiaryClient:
         *,
         content: str,
         message: str | None = None,
+        mode: str = "replace",
     ) -> dict[str, Any]:
-        """Update a single persona document (agent self-update)."""
-        body: dict[str, Any] = {"content": content}
+        """Update a single persona document (agent self-update).
+
+        Args:
+            name: Document name (SOUL, AGENT, RULES, STYLE, EXAMPLES, MEMORY).
+            content: New content for the document.
+            message: Optional human-readable commit message.
+            mode: How to apply *content*. One of:
+                - ``"replace"`` (default) — overwrite the document entirely.
+                - ``"append"``  — add *content* after the existing text.
+                - ``"prepend"`` — add *content* before the existing text.
+        """
+        if mode not in ("replace", "append", "prepend"):
+            raise ValueError(f"Invalid mode {mode!r}. Allowed: replace, append, prepend.")
+        body: dict[str, Any] = {"content": content, "mode": mode}
         if message is not None:
             body["message"] = message
         return self._request("PATCH", f"/api/v1/persona/documents/{name}", json=body)
+
+    def update_memory(
+        self,
+        *,
+        content: str,
+        message: str | None = None,
+        mode: str = "append",
+    ) -> dict[str, Any]:
+        """Update the agent's MEMORY document.
+
+        Calls the dedicated ``PATCH /api/v1/persona/memory`` endpoint.
+        Agents use this to persist learned facts, project context, and runtime
+        observations across executions.
+
+        Args:
+            content: Content to write to the MEMORY document.
+            message: Optional human-readable commit message (e.g. "learned new auth pattern").
+            mode: How to apply *content*. One of:
+                - ``"append"``  (default) — add *content* after existing text.
+                - ``"prepend"`` — add *content* before existing text.
+                - ``"replace"`` — overwrite the document entirely.
+        """
+        if mode not in ("replace", "append", "prepend"):
+            raise ValueError(f"Invalid mode {mode!r}. Allowed: replace, append, prepend.")
+        body: dict[str, Any] = {"content": content, "mode": mode}
+        if message is not None:
+            body["message"] = message
+        return self._request("PATCH", "/api/v1/persona/memory", json=body)
 
     # ------------------------------------------------------------------
     # Lifecycle
