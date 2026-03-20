@@ -1073,6 +1073,68 @@ apiary_update_rate_limit() {
 
 # ── Persona ──────────────────────────────────────────────────────
 
+# apiary_get_persona_version — lightweight version check for hot-reload polling.
+#   [-k KNOWN_VERSION]  (optional) — if set, response includes a 'changed' bool
+#
+# Returns the server-assigned persona version for this agent without fetching full
+# documents. When -k KNOWN_VERSION is provided, the response also includes
+# 'changed' (true/false) comparing the server version to the provided value.
+apiary_get_persona_version() {
+    local known_version="" query_string=""
+    local OPTIND OPTARG opt
+    while getopts "k:" opt; do
+        case "$opt" in
+            k) known_version="$OPTARG" ;;
+            *) _apiary_err "get_persona_version: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -n "$known_version" ]]; then
+        query_string="?known_version=${known_version}"
+    fi
+
+    _apiary_request GET "/api/v1/persona/version${query_string}"
+}
+
+# apiary_check_persona_version — returns 0 (true) if persona version has changed.
+#   -k KNOWN_VERSION  (required) — the version the agent currently holds locally
+#
+# Returns exit code 0 if the server persona version differs from KNOWN_VERSION
+# (i.e., the agent should refresh its persona), or 1 if unchanged.
+# Exits with APIARY_ERR on request failure.
+apiary_check_persona_version() {
+    local known_version=""
+    local OPTIND OPTARG opt
+    while getopts "k:" opt; do
+        case "$opt" in
+            k) known_version="$OPTARG" ;;
+            *) _apiary_err "check_persona_version: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$known_version" ]]; then
+        _apiary_err "check_persona_version: -k KNOWN_VERSION is required"
+        return $APIARY_ERR
+    fi
+
+    if ! jq --version >/dev/null 2>&1; then
+        _apiary_err "check_persona_version: jq is required (install jq and retry)"
+        return $APIARY_ERR_DEPS
+    fi
+
+    local result
+    result=$(apiary_get_persona_version -k "$known_version") || return $?
+
+    local changed
+    changed=$(echo "$result" | jq -r '.changed // "false"')
+
+    if [[ "$changed" == "true" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # apiary_get_persona — get the agent's active persona (policy-selected version).
 apiary_get_persona() {
     _apiary_request GET "/api/v1/persona"

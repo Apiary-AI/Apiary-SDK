@@ -89,6 +89,42 @@ class ApiaryClient:
 
         return body.get("data")
 
+    def _request_envelope(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Like :meth:`_request` but returns the full ``{data, meta, errors}`` envelope."""
+        response = self._http.request(
+            method,
+            path,
+            json=json,
+            params=params,
+            headers=self._headers(),
+        )
+
+        try:
+            body = response.json()
+        except Exception:
+            if response.status_code >= 400:
+                snippet = response.text[:200]
+                raise ApiaryError(
+                    f"HTTP {response.status_code}: {snippet}",
+                    status_code=response.status_code,
+                )
+            raise ApiaryError(
+                f"Expected JSON response, got {response.headers.get('content-type', 'unknown')}",
+                status_code=response.status_code,
+            )
+
+        if response.status_code >= 400:
+            raise_for_status(response.status_code, body)
+
+        return body
+
     # ------------------------------------------------------------------
     # Agent auth
     # ------------------------------------------------------------------
@@ -297,13 +333,49 @@ class ApiaryClient:
         capability: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Poll for available tasks. Returns a list (may be empty)."""
+        """Poll for available tasks. Returns a list (may be empty).
+
+        The response envelope also contains ``meta.persona_version`` — the
+        server-assigned persona version for this agent. Use
+        :meth:`poll_tasks_with_meta` when you need to inspect that field.
+        """
         params: dict[str, Any] = {}
         if capability is not None:
             params["capability"] = capability
         if limit is not None:
             params["limit"] = limit
         return self._request("GET", f"/api/v1/hives/{hive_id}/tasks/poll", params=params)
+
+    def poll_tasks_with_meta(
+        self,
+        hive_id: str,
+        *,
+        capability: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Poll for available tasks and return the full envelope.
+
+        Unlike :meth:`poll_tasks`, this method returns the full
+        ``{data, meta, errors}`` envelope so callers can inspect
+        ``meta["persona_version"]`` and react to persona changes without
+        issuing a separate request.
+
+        Example::
+
+            envelope = client.poll_tasks_with_meta(hive_id)
+            tasks = envelope["data"]
+            server_persona_version = envelope.get("meta", {}).get("persona_version")
+            if server_persona_version != my_cached_version:
+                persona = client.get_persona()  # refresh local cache
+        """
+        params: dict[str, Any] = {}
+        if capability is not None:
+            params["capability"] = capability
+        if limit is not None:
+            params["limit"] = limit
+        return self._request_envelope(
+            "GET", f"/api/v1/hives/{hive_id}/tasks/poll", params=params or None
+        )
 
     def claim_task(self, hive_id: str, task_id: str) -> dict[str, Any]:
         """Atomically claim a pending task."""
@@ -603,6 +675,42 @@ class ApiaryClient:
     # ------------------------------------------------------------------
     # Persona
     # ------------------------------------------------------------------
+
+    def get_persona_version(self, *, known_version: int | None = None) -> dict[str, Any]:
+        """Get the server-assigned persona version for this agent.
+
+        Lightweight alternative to :meth:`get_persona` — fetches only the version
+        number without downloading full documents. Use this in poll loops to detect
+        persona changes efficiently.
+
+        Args:
+            known_version: If provided, the response will include a ``changed``
+                boolean comparing the server version against this value.
+
+        Returns:
+            A dict with ``version`` (int | None) and optionally ``changed`` (bool).
+        """
+        params: dict[str, Any] = {}
+        if known_version is not None:
+            params["known_version"] = known_version
+        return self._request("GET", "/api/v1/persona/version", params=params or None)
+
+    def check_persona_version(self, known_version: int | None) -> bool:
+        """Return True if the server-assigned persona version differs from *known_version*.
+
+        Calls ``GET /api/v1/persona/version?known_version=N`` and returns the
+        ``changed`` field. Returns True (treat as changed) when the agent has no
+        persona assigned (version is None) and *known_version* is also None only if
+        the server explicitly signals a change; otherwise returns False for None/None.
+
+        Args:
+            known_version: The version number the agent currently holds locally.
+
+        Returns:
+            True if the persona should be refreshed, False otherwise.
+        """
+        result = self.get_persona_version(known_version=known_version)
+        return bool(result.get("changed", False))
 
     def get_persona(self) -> dict[str, Any]:
         """Get the agent's active persona (policy-selected version)."""

@@ -8,7 +8,7 @@ import pytest
 
 from apiary_sdk import ApiaryClient
 
-from .conftest import BASE_URL, TOKEN, envelope
+from .conftest import BASE_URL, HIVE_ID, TOKEN, envelope
 
 
 def _persona_data(**overrides):
@@ -205,3 +205,109 @@ class TestUpdateMemory:
         with ApiaryClient(BASE_URL, token=TOKEN) as c:
             with pytest.raises(ValueError, match="Invalid mode"):
                 c.update_memory(content="x", mode="overwrite")
+
+
+class TestGetPersonaVersion:
+    """Tests for get_persona_version() — lightweight version polling (TASK-132)."""
+
+    def test_get_persona_version_returns_version(self, httpx_mock):
+        data = {"version": 3}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version()
+        assert result["version"] == 3
+        assert "changed" not in result
+
+    def test_get_persona_version_with_known_version_passes_param(self, httpx_mock):
+        data = {"version": 3, "changed": False}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version(known_version=3)
+        assert result["version"] == 3
+        assert result["changed"] is False
+
+    def test_get_persona_version_changed_true_when_version_differs(self, httpx_mock):
+        data = {"version": 4, "changed": True}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version(known_version=3)
+        assert result["changed"] is True
+
+    def test_get_persona_version_null_when_no_persona(self, httpx_mock):
+        data = {"version": None}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version()
+        assert result["version"] is None
+
+
+class TestCheckPersonaVersion:
+    """Tests for check_persona_version() — boolean changed helper (TASK-132)."""
+
+    def test_check_persona_version_returns_false_when_unchanged(self, httpx_mock):
+        data = {"version": 2, "changed": False}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            changed = c.check_persona_version(known_version=2)
+        assert changed is False
+
+    def test_check_persona_version_returns_true_when_changed(self, httpx_mock):
+        data = {"version": 5, "changed": True}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            changed = c.check_persona_version(known_version=2)
+        assert changed is True
+
+    def test_check_persona_version_returns_false_when_changed_absent(self, httpx_mock):
+        # Server may omit 'changed' when known_version is None.
+        data = {"version": 1}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=1",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            changed = c.check_persona_version(known_version=1)
+        assert changed is False
+
+
+class TestPollTasksWithMeta:
+    """Tests for poll_tasks_with_meta() — full envelope with persona_version (TASK-132)."""
+
+    def test_poll_tasks_with_meta_returns_full_envelope(self, httpx_mock):
+        tasks = [{"id": "01ABC", "type": "default"}]
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
+            json={"data": tasks, "meta": {"total": 1, "persona_version": 3}, "errors": None},
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            envelope_result = c.poll_tasks_with_meta(HIVE_ID)
+        assert envelope_result["data"] == tasks
+        assert envelope_result["meta"]["persona_version"] == 3
+        assert envelope_result["meta"]["total"] == 1
+
+    def test_poll_tasks_with_meta_persona_version_none_when_no_persona(self, httpx_mock):
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
+            json={"data": [], "meta": {"total": 0, "persona_version": None}, "errors": None},
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            envelope_result = c.poll_tasks_with_meta(HIVE_ID)
+        assert envelope_result["meta"]["persona_version"] is None
