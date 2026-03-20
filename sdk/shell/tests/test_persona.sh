@@ -449,6 +449,206 @@ assert_ne "$rc" "0" "persona-update-memory without args exits non-zero"
 assert_contains "$output" "persona-update-memory" \
     "persona-update-memory without args prints usage hint"
 
+# ── Get persona version (TASK-132) ──────────────────────────────
+
+describe "apiary_get_persona_version (no known_version)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version)
+assert_eq "$(echo "$result" | jq '.version')" "3" "get_persona_version returns version"
+assert_eq "$(echo "$result" | jq 'has("changed")')" "false" \
+    "get_persona_version response has no changed key without -k"
+
+method=$(mock_last_method)
+assert_eq "$method" "GET" "get_persona_version uses GET method"
+
+url=$(mock_last_url)
+assert_contains "$url" "/api/v1/persona/version" "get_persona_version URL is correct"
+
+# ── Get persona version — with known_version ─────────────────────
+
+describe "apiary_get_persona_version (with -k KNOWN_VERSION)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"changed":false},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version -k 3)
+assert_eq "$(echo "$result" | jq '.version')" "3" "get_persona_version -k returns version"
+assert_eq "$(echo "$result" | jq '.changed')" "false" "get_persona_version -k returns changed=false when same"
+
+url=$(mock_last_url)
+assert_contains "$url" "known_version=3" "get_persona_version -k passes known_version in query string"
+
+# ── Get persona version — version changed ────────────────────────
+
+describe "apiary_get_persona_version (version changed)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":4,"changed":true},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version -k 2)
+assert_eq "$(echo "$result" | jq '.version')" "4" "get_persona_version -k returns new version"
+assert_eq "$(echo "$result" | jq '.changed')" "true" "get_persona_version -k returns changed=true when different"
+
+# ── Check persona version — unchanged ────────────────────────────
+
+describe "apiary_check_persona_version (unchanged, exit 1)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"changed":false},"meta":{},"errors":null}'
+
+set +e
+apiary_check_persona_version -k 3
+rc=$?
+set -e
+assert_eq "$rc" "1" "check_persona_version exits 1 when persona unchanged"
+
+# ── Check persona version — changed ──────────────────────────────
+
+describe "apiary_check_persona_version (changed, exit 0)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":5,"changed":true},"meta":{},"errors":null}'
+
+set +e
+apiary_check_persona_version -k 2
+rc=$?
+set -e
+assert_eq "$rc" "0" "check_persona_version exits 0 when persona changed"
+
+# ── Check persona version — missing -k ───────────────────────────
+
+describe "apiary_check_persona_version (missing -k)"
+
+assert_exit 1 apiary_check_persona_version "check_persona_version exits error without -k"
+
+# ── CLI: persona-get-version ─────────────────────────────────────
+# Source the real apiary-cli so _cli_dispatch is available in-process.
+# This keeps the mock curl function override active while exercising the
+# actual dispatch block (apiary-cli lines 326-343) rather than a local copy.
+
+# shellcheck source=../bin/apiary-cli
+source "${SCRIPT_DIR}/../bin/apiary-cli"
+
+describe "apiary-cli persona-get-version"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":7},"meta":{},"errors":null}'
+
+result=$(_cli_dispatch persona-get-version)
+assert_eq "$(echo "$result" | jq '.version')" "7" "persona-get-version CLI returns version"
+
+# ── CLI: persona-check-version — changed ─────────────────────────
+
+describe "apiary-cli persona-check-version (changed)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":7,"changed":true},"meta":{},"errors":null}'
+
+result=$(_cli_dispatch persona-check-version -k 3)
+assert_eq "$result" "changed" "persona-check-version CLI prints 'changed' when version differs"
+
+# ── CLI: persona-check-version — unchanged ───────────────────────
+
+describe "apiary-cli persona-check-version (unchanged)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":7,"changed":false},"meta":{},"errors":null}'
+
+set +e
+result=$(_cli_dispatch persona-check-version -k 7)
+rc=$?
+set -e
+assert_eq "$result" "unchanged" "persona-check-version CLI prints 'unchanged' when version same"
+
+# ── CLI: persona-check-version — missing -k ──────────────────────
+
+describe "apiary-cli persona-check-version (missing -k)"
+
+set +e
+output=$(_cli_dispatch persona-check-version 2>&1)
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "persona-check-version without -k exits non-zero"
+assert_contains "$output" "persona-check-version" \
+    "persona-check-version without -k prints usage hint"
+
+# ── CLI: persona-check-version — failure propagation ─────────────
+
+describe "apiary-cli persona-check-version (auth failure propagation)"
+
+# Simulate an auth error (401) from the server. The helper returns
+# APIARY_ERR_AUTH (3). The CLI must exit non-zero and must NOT print
+# "unchanged" (which would wrongly mask the real failure).
+mock_reset
+mock_response GET "/api/v1/persona/version" 401 \
+    '{"data":null,"meta":{},"errors":[{"message":"Unauthorized","code":"unauthorized"}]}'
+
+set +e
+output=$(_cli_dispatch persona-check-version -k 3 2>&1)
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "persona-check-version exits non-zero on auth failure"
+assert_ne "$output" "unchanged" "persona-check-version does not print 'unchanged' on auth failure"
+
+# ── CLI: persona-check-version (unchanged) under set -e ──────────
+# Regression test for the set -e bug: when apiary_check_persona_version
+# returns 1 (unchanged), bash would exit early under errexit before the
+# CLI could print "unchanged" and return the intended exit code.
+# The fix uses "|| _rc=$?" to capture the exit code without triggering
+# errexit.  We test this by calling _cli_dispatch inside a subshell that
+# has set -e active — the call must NOT abort the subshell.
+
+describe "apiary-cli persona-check-version (unchanged) survives set -e"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":7,"changed":false},"meta":{},"errors":null}'
+
+# Run _cli_dispatch in a subshell with set -e active.  If the old bug is
+# present the subshell exits with code 1 but never prints "unchanged".
+# With the fix, the subshell exits 1 AND prints "unchanged".
+set +e
+result=$(
+    set -e
+    _cli_dispatch persona-check-version -k 7
+    echo "SHOULD_NOT_REACH"
+)
+rc=$?
+set -e
+
+assert_eq "$rc" "1" "persona-check-version (unchanged) exits 1 under set -e"
+assert_eq "$result" "unchanged" "persona-check-version (unchanged) prints 'unchanged' under set -e"
+
+# ── CLI: inherited APIARY_OK environment variable guard ──────────
+# Regression: if APIARY_OK=1 is present in the environment when apiary-cli
+# is executed directly, the old variable-based guard would skip sourcing
+# apiary-sdk.sh, leaving apiary_check_deps undefined and causing a
+# "command not found" error.  The function-presence guard must source the
+# SDK regardless of any inherited APIARY_OK value.
+
+describe "apiary-cli: APIARY_OK in environment does not break execution"
+
+set +e
+output=$(env APIARY_OK=1 bash "${SCRIPT_DIR}/../bin/apiary-cli" version 2>&1)
+rc=$?
+set -e
+
+assert_ne "$rc" "127" "apiary-cli version with APIARY_OK=1 does not exit 127 (command not found)"
+assert_contains "$output" "apiary-sdk" "apiary-cli version with APIARY_OK=1 prints SDK version"
+
 # ── Summary ──────────────────────────────────────────────────────
 
 test_summary
