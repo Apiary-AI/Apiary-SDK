@@ -1096,24 +1096,31 @@ apiary_get_persona_assembled() {
 }
 
 # apiary_update_persona_document — agent self-update of an unlocked document.
-#   NAME  -c CONTENT  [-m MESSAGE]
+#   NAME  -c CONTENT  [-m MESSAGE]  [-M MODE]
+#   MODE: replace (default), append, prepend
 #   Returns 403 if the document is locked by policy.
 apiary_update_persona_document() {
-    local name="${1:?usage: apiary_update_persona_document NAME -c CONTENT [-m MESSAGE]}"
+    local name="${1:?usage: apiary_update_persona_document NAME -c CONTENT [-m MESSAGE] [-M MODE]}"
     shift
-    local content="" message=""
+    local content="" message="" mode="replace"
     local message_set=0
     local OPTIND OPTARG opt
-    while getopts "c:m:" opt; do
+    while getopts "c:m:M:" opt; do
         case "$opt" in
             c) content="$OPTARG" ;;
             m) message="$OPTARG"; message_set=1 ;;
+            M) mode="$OPTARG" ;;
             *) _apiary_err "update_persona_document: unknown option -$opt"; return $APIARY_ERR ;;
         esac
     done
 
     if [[ -z "$content" ]]; then
         _apiary_err "update_persona_document: -c CONTENT is required"
+        return $APIARY_ERR
+    fi
+
+    if [[ "$mode" != "replace" && "$mode" != "append" && "$mode" != "prepend" ]]; then
+        _apiary_err "update_persona_document: -M MODE must be replace, append, or prepend"
         return $APIARY_ERR
     fi
 
@@ -1136,17 +1143,71 @@ apiary_update_persona_document() {
     # empty string) is included in the body rather than silently dropped.
     local body
     if [[ "$message_set" -eq 1 ]]; then
-        body=$(jq -n --arg content "$content" --arg message "$message" \
-            '{content: $content, message: $message}') || {
+        body=$(jq -n --arg content "$content" --arg message "$message" --arg mode "$mode" \
+            '{content: $content, message: $message, mode: $mode}') || {
             _apiary_err "update_persona_document: failed to build JSON body"
             return $APIARY_ERR
         }
     else
-        body=$(jq -n --arg content "$content" \
-            '{content: $content}') || {
+        body=$(jq -n --arg content "$content" --arg mode "$mode" \
+            '{content: $content, mode: $mode}') || {
             _apiary_err "update_persona_document: failed to build JSON body"
             return $APIARY_ERR
         }
     fi
     _apiary_request PATCH "/api/v1/persona/documents/${name}" "$body"
+}
+
+# apiary_update_memory — agent self-update of the MEMORY document.
+#   -c CONTENT  (required) — content to write
+#   -m MESSAGE  (optional) — commit message
+#   -M MODE     (optional) — replace | append (default) | prepend
+#
+# Convenience wrapper for apiary_update_persona_document MEMORY.
+# Agents call this to persist learned facts, project context, and runtime
+# observations across executions. Defaults to append mode so that individual
+# calls accumulate knowledge rather than overwriting earlier entries.
+apiary_update_memory() {
+    local content="" message="" mode="append"
+    local message_set=0
+    local OPTIND OPTARG opt
+    while getopts "c:m:M:" opt; do
+        case "$opt" in
+            c) content="$OPTARG" ;;
+            m) message="$OPTARG"; message_set=1 ;;
+            M) mode="$OPTARG" ;;
+            *) _apiary_err "update_memory: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$content" ]]; then
+        _apiary_err "update_memory: -c CONTENT is required"
+        return $APIARY_ERR
+    fi
+
+    if [[ "$mode" != "replace" && "$mode" != "append" && "$mode" != "prepend" ]]; then
+        _apiary_err "update_memory: -M MODE must be replace, append, or prepend"
+        return $APIARY_ERR
+    fi
+
+    if ! jq --version >/dev/null 2>&1; then
+        _apiary_err "update_memory: jq is required (install jq and retry)"
+        return $APIARY_ERR_DEPS
+    fi
+
+    local body
+    if [[ "$message_set" -eq 1 ]]; then
+        body=$(jq -n --arg content "$content" --arg message "$message" --arg mode "$mode" \
+            '{content: $content, message: $message, mode: $mode}') || {
+            _apiary_err "update_memory: failed to build JSON body"
+            return $APIARY_ERR
+        }
+    else
+        body=$(jq -n --arg content "$content" --arg mode "$mode" \
+            '{content: $content, mode: $mode}') || {
+            _apiary_err "update_memory: failed to build JSON body"
+            return $APIARY_ERR
+        }
+    fi
+    _apiary_request PATCH "/api/v1/persona/memory" "$body"
 }

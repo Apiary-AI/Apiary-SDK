@@ -41,6 +41,7 @@
 #   persona-get-document  Get a persona document by name
 #   persona-get-assembled Get pre-assembled system prompt
 #   persona-update-document Update a persona document
+#   persona-update-memory   Update the MEMORY document (append by default)
 #   version       Show SDK version
 #
 # Environment:
@@ -98,6 +99,7 @@ _cli_usage() {
     echo "  persona-get-document  Get a persona document by name"
     echo "  persona-get-assembled Get pre-assembled system prompt"
     echo "  persona-update-document Update a persona document"
+    echo "  persona-update-memory   Update the MEMORY document (append by default)"
     echo "  version          Show SDK version"
     echo ""
     echo "Environment:"
@@ -338,6 +340,13 @@ case "$command" in
             exit 1
         fi
         apiary_update_persona_document "$@"
+        ;;
+    persona-update-memory)
+        if [[ $# -lt 1 ]]; then
+            echo "Usage: apiary-cli persona-update-memory -c CONTENT [-m MESSAGE] [-M MODE]" >&2
+            exit 1
+        fi
+        apiary_update_memory "$@"
         ;;
     rate-limit-status)
         apiary_rate_limit_status

@@ -244,6 +244,153 @@ assert_contains "$err_output" "jq is required" "prints descriptive error when jq
 assert_eq "$(mock_was_called)" "false" \
     "does not send PATCH request when jq is unavailable"
 
+# ── Update persona document — append mode ────────────────────────
+
+describe "apiary_update_persona_document (append mode)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/documents/MEMORY" 200 \
+    '{"data":{"version":5,"document":"MEMORY","content":"old\nnew fact"},"meta":{},"errors":null}'
+
+apiary_update_persona_document MEMORY -c "new fact" -M append >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.mode')" "append" "update_persona_document sends mode=append"
+assert_eq "$(echo "$body" | jq -r '.content')" "new fact" "update_persona_document sends content with append mode"
+
+# ── Update persona document — prepend mode ───────────────────────
+
+describe "apiary_update_persona_document (prepend mode)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/documents/MEMORY" 200 \
+    '{"data":{"version":6,"document":"MEMORY","content":"preamble\nold"},"meta":{},"errors":null}'
+
+apiary_update_persona_document MEMORY -c "preamble" -M prepend >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.mode')" "prepend" "update_persona_document sends mode=prepend"
+
+# ── Update persona document — default mode is replace ────────────
+
+describe "apiary_update_persona_document (default mode is replace)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/documents/MEMORY" 200 \
+    '{"data":{"version":7,"document":"MEMORY","content":"fresh"},"meta":{},"errors":null}'
+
+apiary_update_persona_document MEMORY -c "fresh" >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.mode')" "replace" "update_persona_document defaults to mode=replace"
+
+# ── Update persona document — invalid mode ───────────────────────
+
+describe "apiary_update_persona_document (invalid mode)"
+
+set +e
+err_output=$(apiary_update_persona_document MEMORY -c "x" -M overwrite 2>&1)
+rc=$?
+set -e
+assert_ne "$rc" "0" "update_persona_document exits non-zero for invalid mode"
+assert_contains "$err_output" "replace, append, or prepend" "update_persona_document prints allowed modes on invalid -M"
+
+# ── apiary_update_memory — default mode is append ────────────────
+
+describe "apiary_update_memory (default mode is append)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/memory" 200 \
+    '{"data":{"version":2,"document":"MEMORY","content":"old\nnew fact"},"meta":{},"errors":null}'
+
+result=$(apiary_update_memory -c "new fact")
+assert_eq "$(echo "$result" | jq -r '.document')" "MEMORY" "update_memory returns document=MEMORY"
+assert_eq "$(echo "$result" | jq '.version')" "2" "update_memory returns new version"
+
+method=$(mock_last_method)
+assert_eq "$method" "PATCH" "update_memory uses PATCH method"
+
+url=$(mock_last_url)
+assert_contains "$url" "/api/v1/persona/memory" "update_memory hits /api/v1/persona/memory"
+
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.content')" "new fact" "update_memory sends content"
+assert_eq "$(echo "$body" | jq -r '.mode')" "append" "update_memory defaults to mode=append"
+assert_eq "$(echo "$body" | jq 'has("message")')" "false" "update_memory omits message when not provided"
+
+# ── apiary_update_memory — with message ──────────────────────────
+
+describe "apiary_update_memory (with message)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/memory" 200 \
+    '{"data":{"version":3,"document":"MEMORY","content":"old\nnew fact"},"meta":{},"errors":null}'
+
+apiary_update_memory -c "new fact" -m "schema discovery" >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.message')" "schema discovery" "update_memory sends message"
+
+# ── apiary_update_memory — replace mode ──────────────────────────
+
+describe "apiary_update_memory (replace mode)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/memory" 200 \
+    '{"data":{"version":4,"document":"MEMORY","content":"fresh slate"},"meta":{},"errors":null}'
+
+apiary_update_memory -c "fresh slate" -M replace >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.mode')" "replace" "update_memory sends mode=replace"
+
+# ── apiary_update_memory — prepend mode ──────────────────────────
+
+describe "apiary_update_memory (prepend mode)"
+
+mock_reset
+mock_response PATCH "/api/v1/persona/memory" 200 \
+    '{"data":{"version":5,"document":"MEMORY","content":"preamble\nold"},"meta":{},"errors":null}'
+
+apiary_update_memory -c "preamble" -M prepend >/dev/null
+body=$(mock_last_body)
+assert_eq "$(echo "$body" | jq -r '.mode')" "prepend" "update_memory sends mode=prepend"
+
+# ── apiary_update_memory — missing -c ────────────────────────────
+
+describe "apiary_update_memory (missing -c)"
+
+assert_exit 1 apiary_update_memory "update_memory returns error when -c is missing"
+
+# ── apiary_update_memory — invalid mode ──────────────────────────
+
+describe "apiary_update_memory (invalid mode)"
+
+set +e
+err_output=$(apiary_update_memory -c "x" -M overwrite 2>&1)
+rc=$?
+set -e
+assert_ne "$rc" "0" "update_memory exits non-zero for invalid mode"
+assert_contains "$err_output" "replace, append, or prepend" "update_memory prints allowed modes on invalid -M"
+
+# ── apiary_update_memory — jq unavailable ────────────────────────
+
+describe "apiary_update_memory (jq unavailable)"
+
+mock_reset
+
+_jq_stub_dir=$(mktemp -d)
+printf '#!/bin/sh\nexit 127\n' > "$_jq_stub_dir/jq"
+chmod +x "$_jq_stub_dir/jq"
+_saved_PATH="$PATH"
+PATH="$_jq_stub_dir:$PATH"
+
+rc=0
+err_output=$(apiary_update_memory -c "some content" 2>&1) || rc=$?
+
+PATH="$_saved_PATH"
+rm -rf "$_jq_stub_dir"
+
+assert_eq "$rc" "$APIARY_ERR_DEPS" "update_memory returns APIARY_ERR_DEPS when jq is unavailable"
+assert_contains "$err_output" "jq is required" "update_memory prints descriptive error when jq is unavailable"
+assert_eq "$(mock_was_called)" "false" \
+    "update_memory does not send PATCH request when jq is unavailable"
+
 # ── CLI dispatch — help text ─────────────────────────────────────
 
 describe "apiary-cli persona commands in help text"
@@ -264,6 +411,8 @@ assert_contains "$help_output" "persona-get-assembled" \
     "help text includes persona-get-assembled command"
 assert_contains "$help_output" "persona-update-document" \
     "help text includes persona-update-document command"
+assert_contains "$help_output" "persona-update-memory" \
+    "help text includes persona-update-memory command"
 
 # ── CLI dispatch — argument validation ───────────────────────────
 
@@ -288,6 +437,17 @@ set -e
 assert_ne "$rc" "0" "persona-update-document without NAME exits non-zero"
 assert_contains "$output" "persona-update-document NAME" \
     "persona-update-document without NAME prints usage hint"
+
+describe "apiary-cli persona-update-memory (missing -c)"
+
+set +e
+output=$(bash "$CLI" persona-update-memory 2>&1)
+rc=$?
+set -e
+
+assert_ne "$rc" "0" "persona-update-memory without args exits non-zero"
+assert_contains "$output" "persona-update-memory" \
+    "persona-update-memory without args prints usage hint"
 
 # ── Summary ──────────────────────────────────────────────────────
 
