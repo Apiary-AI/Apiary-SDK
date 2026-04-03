@@ -35,9 +35,10 @@ apiary_create_task "$HIVE_ID" -t "review.pr" \
   -X '{"repo":"Apiary-AI/Apiary-SDK","pr":123}'
 
 # Poll & claim (requires tasks.claim + tasks.update permissions)
-tasks=$(apiary_poll_tasks "$HIVE_ID" -c "code")
-if [[ $(echo "$tasks" | jq 'length') -gt 0 ]]; then
-    task_id=$(echo "$tasks" | jq -r '.[0].id')
+# apiary_poll_tasks returns a {data, meta, errors} envelope; tasks are in .data
+envelope=$(apiary_poll_tasks "$HIVE_ID" -c "code")
+if [[ $(echo "$envelope" | jq '.data | length') -gt 0 ]]; then
+    task_id=$(echo "$envelope" | jq -r '.data[0].id')
     apiary_claim_task "$HIVE_ID" "$task_id"
     apiary_complete_task "$HIVE_ID" "$task_id" -r '{"output": "done"}'
 fi

@@ -169,6 +169,83 @@ class TestCompleteTask:
         assert task["progress"] == 100
 
 
+class TestDeliverResponseTask:
+    RESPONSE_TASK_ID = "01HXYZ00000000000000000099"
+
+    def test_deliver_response_task(self, httpx_mock):
+        result = {"status": "success", "data": {"issues": []}}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/{self.RESPONSE_TASK_ID}/deliver-response",
+            method="POST",
+            json=envelope(
+                _task_data(
+                    id=self.RESPONSE_TASK_ID,
+                    status="completed",
+                    progress=100,
+                    result=result,
+                    completed_at="2026-02-26T12:05:00Z",
+                )
+            ),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            task = c.deliver_response_task(HIVE_ID, self.RESPONSE_TASK_ID, result)
+        assert task["status"] == "completed"
+        assert task["result"] == result
+
+    def test_deliver_response_task_with_status_message(self, httpx_mock):
+        result = {"status": "success", "data": {}}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/{self.RESPONSE_TASK_ID}/deliver-response",
+            method="POST",
+            json=envelope(
+                _task_data(
+                    id=self.RESPONSE_TASK_ID,
+                    status="completed",
+                    result=result,
+                    status_message="All done",
+                )
+            ),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            task = c.deliver_response_task(
+                HIVE_ID,
+                self.RESPONSE_TASK_ID,
+                result,
+                status_message="All done",
+            )
+        assert task["status"] == "completed"
+        assert task["status_message"] == "All done"
+
+    def test_deliver_response_task_uses_post_method(self, httpx_mock):
+        """The endpoint must use POST, not PATCH."""
+        result = {"status": "success"}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/{self.RESPONSE_TASK_ID}/deliver-response",
+            method="POST",
+            json=envelope(_task_data(id=self.RESPONSE_TASK_ID, status="completed")),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            task = c.deliver_response_task(HIVE_ID, self.RESPONSE_TASK_ID, result)
+        assert task["id"] == self.RESPONSE_TASK_ID
+
+    def test_deliver_response_raises_on_403(self, httpx_mock):
+        from apiary_sdk.exceptions import PermissionError as ApiaryPermissionError
+
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/{self.RESPONSE_TASK_ID}/deliver-response",
+            method="POST",
+            status_code=403,
+            json={
+                "data": None,
+                "meta": {},
+                "errors": [{"message": "Forbidden", "code": "forbidden"}],
+            },
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            with pytest.raises(ApiaryPermissionError):
+                c.deliver_response_task(HIVE_ID, self.RESPONSE_TASK_ID, {"status": "success"})
+
+
 class TestFailTask:
     def test_fail(self, httpx_mock):
         httpx_mock.add_response(
