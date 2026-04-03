@@ -291,9 +291,10 @@ class ApiaryClient:
         invoke_context: Any | None = None,
         failure_policy: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        delivery_mode: str = "default",
     ) -> dict[str, Any]:
         """Create a new task in the given hive."""
-        body: dict[str, Any] = {"type": task_type}
+        body: dict[str, Any] = {"type": task_type, "delivery_mode": delivery_mode}
         if priority is not None:
             body["priority"] = priority
         if target_agent_id is not None:
@@ -402,17 +403,113 @@ class ApiaryClient:
         hive_id: str,
         task_id: str,
         *,
-        result: dict[str, Any] | None = None,
+        result: dict[str, Any] | list | None = None,
         status_message: str | None = None,
+        delivery_mode: str | None = None,
+        knowledge_entry_id: str | None = None,
     ) -> dict[str, Any]:
-        """Mark a claimed task as completed."""
+        """Mark a claimed task as completed.
+
+        For normal completions pass *result* directly (dict or list payloads
+        are both supported).  For knowledge-store delivery (large results
+        pre-stored via :class:`~apiary_sdk.large_result.LargeResultDelivery`)
+        pass ``delivery_mode="knowledge"`` and *knowledge_entry_id* instead.
+        """
         body: dict[str, Any] = {}
         if result is not None:
             body["result"] = result
         if status_message is not None:
             body["status_message"] = status_message
+        if delivery_mode is not None:
+            body["delivery_mode"] = delivery_mode
+        if knowledge_entry_id is not None:
+            body["knowledge_entry_id"] = knowledge_entry_id
         return self._request(
             "PATCH", f"/api/v1/hives/{hive_id}/tasks/{task_id}/complete", json=body
+        )
+
+    def complete_task_large(
+        self,
+        hive_id: str,
+        task_id: str,
+        result: Any,
+        *,
+        status_message: str | None = None,
+        key: str | None = None,
+        threshold_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        """Complete a task, automatically offloading large results to the Knowledge Store.
+
+        Serialises *result* and measures its UTF-8 byte length.  If the
+        payload exceeds the threshold (default 1 MB) it is written to a new
+        hive-scoped knowledge entry and the task is completed with
+        ``delivery_mode="knowledge"``.  Small payloads are completed inline.
+
+        This is a convenience wrapper around
+        :meth:`complete_task` +
+        :class:`~apiary_sdk.large_result.LargeResultDelivery`.
+
+        Args:
+            hive_id: Hive that owns the task (and where the knowledge entry
+                will be created when the result is large).
+            task_id: ID of the in-progress task to complete.
+            result: Result data (must be JSON-serialisable).
+            status_message: Optional human-readable status message.
+            key: Knowledge entry key override (default
+                ``"task-result:<task_id>"``).
+            threshold_bytes: Override the 1 MB threshold.
+
+        Returns:
+            The completed task dict returned by the server.
+        """
+        # Import here to avoid a circular import at module level.
+        from apiary_sdk.large_result import LargeResultDelivery  # noqa: PLC0415
+
+        kwargs: dict[str, int] = {}
+        if threshold_bytes is not None:
+            kwargs["threshold_bytes"] = threshold_bytes
+
+        delivery = LargeResultDelivery(self, **kwargs)
+        completion = delivery.deliver(task_id, hive_id, result, key=key)
+
+        return self.complete_task(
+            hive_id,
+            task_id,
+            status_message=status_message,
+            **completion,
+        )
+
+    def deliver_response_task(
+        self,
+        hive_id: str,
+        response_task_id: str,
+        data: dict[str, Any],
+        *,
+        status_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Deliver a response to a pending data_request response task.
+
+        Uses the dedicated ``POST /deliver-response`` endpoint which bypasses
+        the normal in_progress/ownership requirements.  The server authorises
+        the call by verifying the calling agent has an in_progress task whose
+        ``payload.response_task_id`` matches *response_task_id*.
+
+        Args:
+            hive_id: Hive the calling agent belongs to.
+            response_task_id: ID of the pending response task to complete.
+            data: Result payload to store on the response task.
+            status_message: Optional human-readable status message.
+
+        Returns:
+            The completed task dict.
+        """
+        body: dict[str, Any] = {"result": data}
+        if status_message is not None:
+            body["status_message"] = status_message
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/tasks/{response_task_id}/deliver-response",
+            json=body,
         )
 
     def fail_task(
@@ -430,6 +527,69 @@ class ApiaryClient:
         if status_message is not None:
             body["status_message"] = status_message
         return self._request("PATCH", f"/api/v1/hives/{hive_id}/tasks/{task_id}/fail", json=body)
+
+    def send_stream_chunk(
+        self,
+        hive_id: str,
+        task_id: str,
+        *,
+        data: dict[str, Any],
+        sequence: int | None = None,
+        is_final: bool = False,
+        status_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Deliver one chunk of a streaming task result.
+
+        The target task must be ``in_progress`` with ``delivery_mode='stream'``
+        and claimed by the calling agent.  Creates a child ``stream_chunk`` task.
+
+        When *is_final* is ``True`` the parent task is marked completed and no
+        further chunks can be delivered.
+
+        Args:
+            hive_id: The hive that owns the parent task.
+            task_id: ID of the parent stream task.
+            data: Chunk payload dict.
+            sequence: Chunk sequence number.  The server auto-increments when
+                ``None``.
+            is_final: Whether this is the last chunk (completes the parent).
+            status_message: Optional human-readable status stored on the chunk.
+
+        Returns:
+            Dict with ``chunk`` and ``parent`` task dicts.
+        """
+        body: dict[str, Any] = {"data": data, "is_final": is_final}
+        if sequence is not None:
+            body["sequence"] = sequence
+        if status_message is not None:
+            body["status_message"] = status_message
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/tasks/{task_id}/stream-chunk",
+            json=body,
+        )
+
+    def get_stream_chunks(self, hive_id: str, task_id: str) -> dict[str, Any]:
+        """Retrieve all stream chunk child tasks for a stream-mode parent task.
+
+        Returns chunks ordered by ``stream_sequence`` ascending, along with
+        metadata about the parent task (``parent_task_id``, ``stream_complete``,
+        ``count``).
+
+        Args:
+            hive_id: The hive that owns the parent task.
+            task_id: ID of the parent stream task.
+
+        Returns:
+            API envelope whose ``data`` list contains chunk dicts (each with
+            ``id``, ``result``, ``stream_sequence``, ``created_at``) and whose
+            ``meta`` dict contains ``parent_task_id``, ``stream_complete``, and
+            ``count``.
+        """
+        return self._request_envelope(
+            "GET",
+            f"/api/v1/hives/{hive_id}/tasks/{task_id}/stream-chunks",
+        )
 
     # ------------------------------------------------------------------
     # Task replay / time travel
@@ -552,6 +712,68 @@ class ApiaryClient:
     def delete_knowledge(self, hive_id: str, entry_id: str) -> None:
         """Delete a knowledge entry."""
         self._request("DELETE", f"/api/v1/hives/{hive_id}/knowledge/{entry_id}")
+
+    # ------------------------------------------------------------------
+    # Context threads
+    # ------------------------------------------------------------------
+
+    def list_threads(
+        self,
+        hive_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List context threads in a hive."""
+        params: dict[str, Any] = {"limit": limit}
+        return self._request("GET", f"/api/v1/hives/{hive_id}/threads", params=params)
+
+    def create_thread(
+        self,
+        hive_id: str,
+        *,
+        title: str | None = None,
+        message: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new context thread, optionally seeded with an initial message."""
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if message is not None:
+            body["message"] = message
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._request("POST", f"/api/v1/hives/{hive_id}/threads", json=body)
+
+    def get_thread(self, hive_id: str, thread_id: str) -> dict[str, Any]:
+        """Get a single context thread with full message history."""
+        return self._request("GET", f"/api/v1/hives/{hive_id}/threads/{thread_id}")
+
+    def append_thread_message(
+        self,
+        hive_id: str,
+        thread_id: str,
+        message: str,
+        *,
+        task_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append a message to a context thread."""
+        body: dict[str, Any] = {"message": message}
+        if task_id is not None:
+            body["task_id"] = task_id
+        if metadata is not None:
+            body["metadata"] = metadata
+        url = f"/api/v1/hives/{hive_id}/threads/{thread_id}/messages"
+        return self._request("POST", url, json=body)
+
+    def clear_thread_messages(self, hive_id: str, thread_id: str) -> dict[str, Any]:
+        """Clear all messages from a context thread (thread itself is kept)."""
+        return self._request("DELETE", f"/api/v1/hives/{hive_id}/threads/{thread_id}/messages")
+
+    def delete_thread(self, hive_id: str, thread_id: str) -> None:
+        """Delete a context thread and all its messages."""
+        self._request("DELETE", f"/api/v1/hives/{hive_id}/threads/{thread_id}")
 
     # ------------------------------------------------------------------
     # Schedules
@@ -781,6 +1003,193 @@ class ApiaryClient:
         if message is not None:
             body["message"] = message
         return self._request("PATCH", "/api/v1/persona/memory", json=body)
+
+    # ------------------------------------------------------------------
+    # Service workers
+    # ------------------------------------------------------------------
+
+    def data_request(
+        self,
+        hive_id: str,
+        *,
+        capability: str,
+        operation: str,
+        params: dict[str, Any] | None = None,
+        delivery: str = "task_result",
+        result_format: str | None = None,
+        continuation_of: str | None = None,
+        response_task_id: str | None = None,
+        timeout_seconds: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a ``data_request`` task targeting a service worker capability.
+
+        This is a convenience wrapper around :meth:`create_task` for the
+        service worker pattern.  The agent does **not** block — it gets back a
+        ``task_id`` and continues doing other work.  On the next poll cycle it
+        can check the task status with ``GET /api/v1/hives/{hive_id}/tasks/{task_id}``.
+
+        Example::
+
+            ref = client.data_request(
+                hive_id,
+                capability="data:gmail",
+                operation="fetch_emails",
+                params={"query": "from:client@acme.com", "max_results": 50},
+            )
+            task_id = ref["id"]  # save this, check later
+
+        Args:
+            hive_id: Hive to create the task in.
+            capability: Service worker capability to target (e.g. ``"data:gmail"``).
+            operation: Operation name (e.g. ``"fetch_emails"``).
+            params: Operation-specific parameters passed to the worker.
+            delivery: Result delivery mode — ``"task_result"`` (default) or
+                ``"knowledge"``.
+            result_format: Optional hint to the worker (e.g. ``"array"``).
+            continuation_of: Task ID of a previous request to continue from
+                (pagination / resumable operations).
+            response_task_id: If set, the worker will call
+                ``POST /tasks/{id}/deliver-response`` with *this* task ID to
+                push the result (push-style delivery).
+            timeout_seconds: Task-level timeout.
+            idempotency_key: Idempotency key to prevent duplicate requests.
+
+        Returns:
+            The created task dict (``{id, status, ...}``).
+        """
+        payload: dict[str, Any] = {
+            "operation": operation,
+            "delivery": delivery,
+        }
+        if params is not None:
+            payload["params"] = params
+        if result_format is not None:
+            payload["result_format"] = result_format
+        if continuation_of is not None:
+            payload["continuation_of"] = continuation_of
+        if response_task_id is not None:
+            payload["response_task_id"] = response_task_id
+
+        return self.create_task(
+            hive_id,
+            task_type="data_request",
+            target_capability=capability,
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
+        )
+
+    def discover_services(
+        self,
+        hive_id: str,
+        *,
+        capability_prefix: str = "data:",
+    ) -> list[dict[str, Any]]:
+        """List service workers registered in a hive.
+
+        Queries the agents endpoint filtered to the ``data:*`` capability
+        prefix (or a custom prefix) and returns the matching agent records.
+        Each record includes ``metadata.supported_operations`` when the worker
+        has declared them.
+
+        Example::
+
+            services = client.discover_services(hive_id)
+            for svc in services:
+                print(svc["name"], svc.get("metadata", {}).get("supported_operations"))
+
+        Args:
+            hive_id: Hive to query.
+            capability_prefix: Capability prefix to filter on
+                (default ``"data:"``).
+
+        Returns:
+            List of agent dicts matching the capability prefix.
+        """
+        agents = self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/agents",
+            params={"capability": capability_prefix},
+        )
+        if not isinstance(agents, list):
+            return []
+        return [
+            a
+            for a in agents
+            if any(str(cap).startswith(capability_prefix) for cap in (a.get("capabilities") or []))
+        ]
+
+    def discover_service_catalog(
+        self,
+        hive_id: str,
+        *,
+        service_type: str | None = None,
+        capability: str | None = None,
+        status: str = "active",
+        per_page: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List service connections available in a hive via the catalog API.
+
+        Queries ``GET /api/v1/hives/{hive}/services`` and returns all pages
+        as a flat list.  Requires the ``services:read`` permission.
+
+        Example::
+
+            services = client.discover_service_catalog(hive_id)
+            for svc in services:
+                print(svc["name"], svc["service_type"], svc["capabilities"])
+
+        Args:
+            hive_id: Hive to query.
+            service_type: Optional service type filter (e.g. ``"github"``).
+            capability: Optional capability tag filter.
+            status: Status filter — ``"active"`` (default), ``"inactive"``,
+                or ``"all"``.
+            per_page: Page size (1–100, default 50).
+
+        Returns:
+            Flat list of service connection dicts from all pages.
+        """
+        # Clamp per_page to the valid API range (1–100) so the pagination
+        # sentinel ``len(page) < effective_per_page`` is always correct.
+        # Without clamping: per_page>100 → API returns 100 items but
+        # len(100) < 500 is False → first page treated as last page.
+        # per_page<=0 → API returns 1 item but len([]) < 0 is always
+        # False → potential infinite loop.
+        effective_per_page = max(1, min(per_page, 100))
+
+        params: dict[str, Any] = {"status": status, "per_page": effective_per_page}
+
+        if service_type is not None:
+            params["type"] = service_type
+
+        if capability is not None:
+            params["capability"] = capability
+
+        results: list[dict[str, Any]] = []
+        page = 1
+
+        while True:
+            params["page"] = page
+            envelope = self._request(
+                "GET",
+                f"/api/v1/hives/{hive_id}/services",
+                params=params,
+            )
+
+            if not isinstance(envelope, list):
+                break
+
+            results.extend(envelope)
+
+            # Stop if we received fewer records than requested (last page)
+            if len(envelope) < effective_per_page:
+                break
+
+            page += 1
+
+        return results
 
     # ------------------------------------------------------------------
     # Lifecycle

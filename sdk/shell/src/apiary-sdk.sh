@@ -30,6 +30,12 @@ readonly APIARY_ERR_RATE_LIMIT=8   # 429
 # Rate-limit retry-after value (set by _apiary_request on 429 responses)
 _APIARY_RETRY_AFTER=""
 
+# Backpressure signal from poll responses (set by apiary_poll_tasks).
+# Contains the server-recommended milliseconds to wait before the next poll.
+# 0 means "poll immediately"; >0 means "wait this long".
+# Scripts that call apiary_poll_tasks can read this variable to sleep accordingly.
+_APIARY_NEXT_POLL_MS=0
+
 # ── Dependency check ─────────────────────────────────────────────
 apiary_check_deps() {
     local missing=()
@@ -584,6 +590,12 @@ apiary_create_task() {
 
 # apiary_poll_tasks — poll for available tasks.
 #   HIVE_ID  [-c CAPABILITY] [-l LIMIT]
+#
+#   Sets _APIARY_NEXT_POLL_MS to the server-recommended backoff (ms) before the
+#   next poll.  Scripts may read this value to sleep accordingly:
+#
+#       apiary_poll_tasks "$HIVE_ID"
+#       [[ "$_APIARY_NEXT_POLL_MS" -gt 0 ]] && sleep "$(( (_APIARY_NEXT_POLL_MS + 999) / 1000 ))"
 apiary_poll_tasks() {
     local hive_id="${1:?usage: apiary_poll_tasks HIVE_ID [-c CAPABILITY] [-l LIMIT]}"
     shift
@@ -605,7 +617,71 @@ apiary_poll_tasks() {
         qs="?$(IFS='&'; echo "${params[*]}")"
     fi
 
-    _apiary_request GET "/api/v1/hives/${hive_id}/tasks/poll${qs}"
+    # Capture the raw response body to extract both .data and meta.next_poll_ms.
+    local url="${APIARY_BASE_URL:?APIARY_BASE_URL must be set}/api/v1/hives/${hive_id}/tasks/poll${qs}"
+    local timeout="${APIARY_TIMEOUT:-30}"
+
+    local _poll_header_file
+    _poll_header_file=$(mktemp "${TMPDIR:-/tmp}/apiary-sdk-poll-headers.XXXXXXXXXX") || {
+        _apiary_err "poll_tasks: failed to create temp file for response headers"
+        return $APIARY_ERR
+    }
+
+    local -a curl_args=(
+        --silent --show-error --max-time "$timeout"
+        --write-out '\n%{http_code}'
+        -D "$_poll_header_file"
+        -H 'Accept: application/json'
+    )
+    [[ -n "${APIARY_TOKEN:-}" ]] && curl_args+=(-H "Authorization: Bearer ${APIARY_TOKEN}")
+    [[ "${APIARY_DEBUG:-0}" == "1" ]] && curl_args+=(--verbose)
+
+    local raw_output
+    raw_output=$(curl -X GET "${curl_args[@]}" "$url" 2>&${_apiary_debug_fd:-2}) || {
+        _apiary_err "poll_tasks: curl failed (network error or timeout)"
+        rm -f "$_poll_header_file" 2>/dev/null || true
+        return $APIARY_ERR
+    }
+
+    # Extract Retry-After header for rate-limit handling (mirrors _apiary_request behaviour).
+    _APIARY_RETRY_AFTER=""
+    local _ra_line
+    _ra_line=$(grep -i '^retry-after:' "$_poll_header_file" 2>/dev/null | head -1) || true
+    if [[ -n "${_ra_line:-}" ]]; then
+        _APIARY_RETRY_AFTER=$(echo "$_ra_line" | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+    fi
+    rm -f "$_poll_header_file" 2>/dev/null || true
+
+    local http_status response_body
+    http_status=$(echo "$raw_output" | tail -n1)
+    response_body=$(echo "$raw_output" | sed '$d')
+
+    if [[ "$http_status" == "204" ]]; then
+        _APIARY_NEXT_POLL_MS=0
+        return $APIARY_OK
+    fi
+
+    if ! echo "$response_body" | jq empty 2>/dev/null; then
+        _apiary_err "poll_tasks: HTTP ${http_status}: non-JSON response"
+        return $APIARY_ERR
+    fi
+
+    local exit_code
+    exit_code=$(_apiary_exit_code "$http_status")
+    if [[ "$exit_code" -ne 0 ]]; then
+        _apiary_err "poll_tasks: HTTP ${http_status}"
+        echo "$response_body"
+        return "$exit_code"
+    fi
+
+    # Extract backpressure signal from meta.
+    _APIARY_NEXT_POLL_MS=$(echo "$response_body" | jq -r '.meta.next_poll_ms // 0')
+    _APIARY_NEXT_POLL_MS="${_APIARY_NEXT_POLL_MS:-0}"
+
+    # Output the full envelope (preserving {data, meta, errors} shape for callers).
+    echo "$response_body"
+
+    return $APIARY_OK
 }
 
 # apiary_claim_task — atomically claim a pending task.
@@ -661,6 +737,31 @@ apiary_complete_task() {
     local body
     body=$(_apiary_build_json "result" "$result" "status_message" "$status_message") || return $APIARY_ERR
     _apiary_request PATCH "/api/v1/hives/${hive_id}/tasks/${task_id}/complete" "$body"
+}
+
+# apiary_deliver_response — deliver a response to a pending data_request response task.
+#   HIVE_ID  RESPONSE_TASK_ID  [-r RESULT_JSON] [-m STATUS_MESSAGE]
+#
+# Uses POST /deliver-response which bypasses the normal in_progress/ownership
+# checks.  The server verifies the calling agent has an in_progress task whose
+# payload.response_task_id matches the target task ID.
+apiary_deliver_response() {
+    local hive_id="${1:?usage: apiary_deliver_response HIVE_ID RESPONSE_TASK_ID}"
+    local response_task_id="${2:?usage: apiary_deliver_response HIVE_ID RESPONSE_TASK_ID}"
+    shift 2
+    local result="" status_message=""
+    local OPTIND OPTARG opt
+    while getopts "r:m:" opt; do
+        case "$opt" in
+            r) result="$OPTARG" ;;
+            m) status_message="$OPTARG" ;;
+            *) _apiary_err "deliver_response: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local body
+    body=$(_apiary_build_json "result" "$result" "status_message" "$status_message") || return $APIARY_ERR
+    _apiary_request POST "/api/v1/hives/${hive_id}/tasks/${response_task_id}/deliver-response" "$body"
 }
 
 # apiary_fail_task — mark a claimed task as failed.
@@ -1036,6 +1137,96 @@ apiary_delete_knowledge() {
 }
 
 # ======================================================================
+# Context Threads
+# ======================================================================
+
+# apiary_list_threads — list context threads in a hive.
+#   HIVE_ID  [-l LIMIT]
+apiary_list_threads() {
+    local hive_id="${1:?usage: apiary_list_threads HIVE_ID}"
+    shift
+    local limit=""
+    local OPTIND OPTARG opt
+    while getopts "l:" opt; do
+        case "$opt" in
+            l) limit="$OPTARG" ;;
+            *) _apiary_err "list_threads: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+    local qs=""
+    [[ -n "$limit" ]] && qs="${qs:+$qs&}limit=${limit}"
+    [[ -n "$qs" ]] && qs="?${qs}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/threads${qs}"
+}
+
+# apiary_create_thread — create a new context thread.
+#   HIVE_ID  [-t TITLE]  [-m MESSAGE]
+apiary_create_thread() {
+    local hive_id="${1:?usage: apiary_create_thread HIVE_ID [-t TITLE] [-m MESSAGE]}"
+    shift
+    local title="" message=""
+    local OPTIND OPTARG opt
+    while getopts "t:m:" opt; do
+        case "$opt" in
+            t) title="$OPTARG" ;;
+            m) message="$OPTARG" ;;
+            *) _apiary_err "create_thread: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+    local body
+    body=$(_apiary_build_json "title" "$title" "message" "$message") || return $APIARY_ERR
+    _apiary_request POST "/api/v1/hives/${hive_id}/threads" "$body"
+}
+
+# apiary_get_thread — get a context thread with full message history.
+#   HIVE_ID  THREAD_ID
+apiary_get_thread() {
+    local hive_id="${1:?usage: apiary_get_thread HIVE_ID THREAD_ID}"
+    local thread_id="${2:?usage: apiary_get_thread HIVE_ID THREAD_ID}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/threads/${thread_id}"
+}
+
+# apiary_append_thread_message — append a message to a context thread.
+#   HIVE_ID  THREAD_ID  -m MESSAGE  [-T TASK_ID]
+apiary_append_thread_message() {
+    local hive_id="${1:?usage: apiary_append_thread_message HIVE_ID THREAD_ID -m MESSAGE}"
+    local thread_id="${2:?usage: apiary_append_thread_message HIVE_ID THREAD_ID -m MESSAGE}"
+    shift 2
+    local message="" task_id=""
+    local OPTIND OPTARG opt
+    while getopts "m:T:" opt; do
+        case "$opt" in
+            m) message="$OPTARG" ;;
+            T) task_id="$OPTARG" ;;
+            *) _apiary_err "append_thread_message: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+    if [[ -z "$message" ]]; then
+        _apiary_err "append_thread_message: -m MESSAGE is required"
+        return $APIARY_ERR
+    fi
+    local body
+    body=$(_apiary_build_json "message" "$message" "task_id" "$task_id") || return $APIARY_ERR
+    _apiary_request POST "/api/v1/hives/${hive_id}/threads/${thread_id}/messages" "$body"
+}
+
+# apiary_clear_thread_messages — clear all messages from a context thread.
+#   HIVE_ID  THREAD_ID
+apiary_clear_thread_messages() {
+    local hive_id="${1:?usage: apiary_clear_thread_messages HIVE_ID THREAD_ID}"
+    local thread_id="${2:?usage: apiary_clear_thread_messages HIVE_ID THREAD_ID}"
+    _apiary_request DELETE "/api/v1/hives/${hive_id}/threads/${thread_id}/messages"
+}
+
+# apiary_delete_thread — delete a context thread and all its messages.
+#   HIVE_ID  THREAD_ID
+apiary_delete_thread() {
+    local hive_id="${1:?usage: apiary_delete_thread HIVE_ID THREAD_ID}"
+    local thread_id="${2:?usage: apiary_delete_thread HIVE_ID THREAD_ID}"
+    _apiary_request DELETE "/api/v1/hives/${hive_id}/threads/${thread_id}"
+}
+
+# ======================================================================
 # Rate Limiting
 # ======================================================================
 
@@ -1272,4 +1463,207 @@ apiary_update_memory() {
         }
     fi
     _apiary_request PATCH "/api/v1/persona/memory" "$body"
+}
+
+# ── Service worker helpers ────────────────────────────────────────────
+#
+# These helpers implement the service worker pattern from
+# docs/features/list-1/FEATURE_SERVICE_WORKERS.md.
+#
+# A service worker is a regular agent with a "data:<service>" capability
+# that polls for "data_request" tasks and executes named operations.
+
+# apiary_data_request HIVE_ID — create a data_request task.
+#   Required:
+#     -c CAPABILITY   target service worker capability (e.g. "data:gmail")
+#     -o OPERATION    operation name (e.g. "fetch_emails")
+#   Optional:
+#     -p PARAMS_JSON  operation parameters as a JSON object (default: {})
+#     -d DELIVERY     delivery mode: task_result (default) | knowledge
+#     -f FORMAT       result_format hint passed to the worker
+#     -C TASK_ID      continuation_of — resume from a previous request
+#     -r TASK_ID      response_task_id — push result to this task (push-style delivery)
+#     -t TIMEOUT      task timeout in seconds
+#     -k IDEMPOTENCY  idempotency key
+#
+# Prints the created task JSON (data envelope unwrapped) to stdout.
+#
+# Example:
+#   apiary_data_request "$HIVE_ID" \
+#       -c data:gmail \
+#       -o fetch_emails \
+#       -p '{"query":"from:boss@acme.com","max_results":20}'
+apiary_data_request() {
+    local hive_id="$1"
+    shift || { _apiary_err "data_request: HIVE_ID is required"; return $APIARY_ERR; }
+
+    local capability="" operation="" params="" delivery="task_result"
+    local result_format="" continuation_of="" response_task_id="" timeout_seconds="" idempotency_key=""
+    local OPTIND OPTARG opt
+    while getopts "c:o:p:d:f:C:r:t:k:" opt; do
+        case "$opt" in
+            c) capability="$OPTARG" ;;
+            o) operation="$OPTARG" ;;
+            p) params="$OPTARG" ;;
+            d) delivery="$OPTARG" ;;
+            f) result_format="$OPTARG" ;;
+            C) continuation_of="$OPTARG" ;;
+            r) response_task_id="$OPTARG" ;;
+            t) timeout_seconds="$OPTARG" ;;
+            k) idempotency_key="$OPTARG" ;;
+            *) _apiary_err "data_request: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$capability" ]]; then
+        _apiary_err "data_request: -c CAPABILITY is required"
+        return $APIARY_ERR
+    fi
+    if [[ -z "$operation" ]]; then
+        _apiary_err "data_request: -o OPERATION is required"
+        return $APIARY_ERR
+    fi
+
+    # Build payload JSON
+    local payload
+    if [[ -n "$params" ]]; then
+        payload=$(jq -n \
+            --arg op "$operation" \
+            --arg del "$delivery" \
+            --argjson p "$params" \
+            '{operation: $op, delivery: $del, params: $p}') || {
+            _apiary_err "data_request: invalid params JSON"
+            return $APIARY_ERR
+        }
+    else
+        payload=$(jq -n \
+            --arg op "$operation" \
+            --arg del "$delivery" \
+            '{operation: $op, delivery: $del}') || {
+            _apiary_err "data_request: failed to build payload"
+            return $APIARY_ERR
+        }
+    fi
+
+    if [[ -n "$result_format" ]]; then
+        payload=$(echo "$payload" | jq --arg f "$result_format" '. + {result_format: $f}')
+    fi
+    if [[ -n "$continuation_of" ]]; then
+        payload=$(echo "$payload" | jq --arg c "$continuation_of" '. + {continuation_of: $c}')
+    fi
+    if [[ -n "$response_task_id" ]]; then
+        payload=$(echo "$payload" | jq --arg r "$response_task_id" '. + {response_task_id: $r}')
+    fi
+
+    # Build task body
+    local body
+    body=$(jq -n \
+        --arg type "data_request" \
+        --arg cap "$capability" \
+        --argjson payload "$payload" \
+        '{type: $type, target_capability: $cap, payload: $payload}') || {
+        _apiary_err "data_request: failed to build request body"
+        return $APIARY_ERR
+    }
+
+    if [[ -n "$timeout_seconds" ]]; then
+        body=$(echo "$body" | jq --argjson t "$timeout_seconds" '. + {timeout_seconds: $t}')
+    fi
+    if [[ -n "$idempotency_key" ]]; then
+        body=$(echo "$body" | jq --arg k "$idempotency_key" '. + {idempotency_key: $k}')
+    fi
+
+    _apiary_request POST "/api/v1/hives/${hive_id}/tasks" "$body"
+}
+
+# apiary_data_request_dispatch HIVE_ID — dispatch a data_request from inside a service worker.
+#
+# This is the service-worker-side companion to apiary_data_request.
+# Use it when one service worker needs data from another worker.
+#
+#   Required:
+#     -o OPERATION    operation name to request
+#   Optional:
+#     -c CAPABILITY   target capability (default: value of $APIARY_CAPABILITY)
+#     -p PARAMS_JSON  operation parameters as a JSON object (default: {})
+#     -d DELIVERY     delivery mode: task_result (default) | knowledge
+#     -r TASK_ID      response_task_id — push result to this task (push-style delivery)
+#     -t TIMEOUT      task timeout in seconds
+#     -k IDEMPOTENCY  idempotency key
+#
+# Prints the created task JSON to stdout.
+#
+# Example (inside a worker script):
+#   apiary_data_request_dispatch "$HIVE_ID" \
+#       -c data:github \
+#       -o fetch_issues \
+#       -p '{"repo":"acme/backend","state":"open"}'
+apiary_data_request_dispatch() {
+    local hive_id="$1"
+    shift || { _apiary_err "data_request_dispatch: HIVE_ID is required"; return $APIARY_ERR; }
+
+    local capability="${APIARY_CAPABILITY:-}" operation="" params="" delivery="task_result"
+    local response_task_id="" timeout_seconds="" idempotency_key=""
+    local OPTIND OPTARG opt
+    while getopts "c:o:p:d:r:t:k:" opt; do
+        case "$opt" in
+            c) capability="$OPTARG" ;;
+            o) operation="$OPTARG" ;;
+            p) params="$OPTARG" ;;
+            d) delivery="$OPTARG" ;;
+            r) response_task_id="$OPTARG" ;;
+            t) timeout_seconds="$OPTARG" ;;
+            k) idempotency_key="$OPTARG" ;;
+            *) _apiary_err "data_request_dispatch: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$capability" ]]; then
+        _apiary_err "data_request_dispatch: -c CAPABILITY is required (or set \$APIARY_CAPABILITY)"
+        return $APIARY_ERR
+    fi
+    if [[ -z "$operation" ]]; then
+        _apiary_err "data_request_dispatch: -o OPERATION is required"
+        return $APIARY_ERR
+    fi
+
+    # Delegate to apiary_data_request with the same args
+    local extra_args=()
+    [[ -n "$params" ]]           && extra_args+=(-p "$params")
+    [[ -n "$delivery" ]]         && extra_args+=(-d "$delivery")
+    [[ -n "$response_task_id" ]] && extra_args+=(-r "$response_task_id")
+    [[ -n "$timeout_seconds" ]]  && extra_args+=(-t "$timeout_seconds")
+    [[ -n "$idempotency_key" ]]  && extra_args+=(-k "$idempotency_key")
+
+    apiary_data_request "$hive_id" -c "$capability" -o "$operation" "${extra_args[@]}"
+}
+
+# apiary_discover_services HIVE_ID — list service workers in a hive.
+#   Optional:
+#     -p PREFIX  capability prefix to filter on (default: "data:")
+#
+# Queries GET /api/v1/hives/{hive_id}/agents?capability=<PREFIX> and
+# prints the matching agent JSON array to stdout.
+#
+# Example:
+#   apiary_discover_services "$HIVE_ID"
+#   apiary_discover_services "$HIVE_ID" -p custom:
+apiary_discover_services() {
+    local hive_id="$1"
+    shift || { _apiary_err "discover_services: HIVE_ID is required"; return $APIARY_ERR; }
+
+    local prefix="data:"
+    local OPTIND OPTARG opt
+    while getopts "p:" opt; do
+        case "$opt" in
+            p) prefix="$OPTARG" ;;
+            *) _apiary_err "discover_services: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local params=()
+    params+=("capability=$(_apiary_urlencode "$prefix")")
+    local qs="?$(IFS='&'; echo "${params[*]}")"
+
+    _apiary_request GET "/api/v1/hives/${hive_id}/agents${qs}"
 }

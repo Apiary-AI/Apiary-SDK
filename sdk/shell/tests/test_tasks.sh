@@ -76,11 +76,13 @@ describe "apiary_poll_tasks"
 
 mock_reset
 mock_response GET "/api/v1/hives/${HIVE}/tasks/poll" 200 \
-    '{"data":[{"id":"t1","type":"summarize","status":"pending"},{"id":"t2","type":"code","status":"pending"}],"meta":{"total":2},"errors":null}'
+    '{"data":[{"id":"t1","type":"summarize","status":"pending"},{"id":"t2","type":"code","status":"pending"}],"meta":{"total":2,"next_poll_ms":2000},"errors":null}'
 
 result=$(apiary_poll_tasks "$HIVE")
-assert_eq "$(echo "$result" | jq 'length')" "2" "poll_tasks returns array of tasks"
-assert_eq "$(echo "$result" | jq -r '.[0].id')" "t1" "poll_tasks first task id correct"
+assert_eq "$(echo "$result" | jq '.data | length')" "2" "poll_tasks returns full envelope with data array"
+assert_eq "$(echo "$result" | jq -r '.data[0].id')" "t1" "poll_tasks full envelope first task id correct"
+assert_eq "$(echo "$result" | jq '.meta.next_poll_ms')" "2000" "poll_tasks full envelope contains meta.next_poll_ms"
+assert_eq "$_APIARY_NEXT_POLL_MS" "2000" "poll_tasks sets _APIARY_NEXT_POLL_MS from meta"
 
 method=$(mock_last_method)
 assert_eq "$method" "GET" "poll_tasks uses GET method"
