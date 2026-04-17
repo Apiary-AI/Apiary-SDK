@@ -649,6 +649,96 @@ set -e
 assert_ne "$rc" "127" "apiary-cli version with APIARY_OK=1 does not exit 127 (command not found)"
 assert_contains "$output" "apiary-sdk" "apiary-cli version with APIARY_OK=1 prints SDK version"
 
+# ── Get persona version — with known_platform_version ─────────────
+
+describe "apiary_get_persona_version (with -k and -p)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":2,"changed":false},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version -k 3 -p 2)
+assert_eq "$(echo "$result" | jq '.version')" "3" "get_persona_version -k -p returns version"
+assert_eq "$(echo "$result" | jq '.platform_context_version')" "2" "get_persona_version -k -p returns platform_context_version"
+assert_eq "$(echo "$result" | jq '.changed')" "false" "get_persona_version -k -p returns changed=false when both match"
+
+url=$(mock_last_url)
+assert_contains "$url" "known_platform_version=2" "get_persona_version -p passes known_platform_version in query string"
+
+# ── Get persona version — platform context changed ────────────────
+
+describe "apiary_get_persona_version (platform context changed)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":5,"changed":true},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version -k 3 -p 2)
+assert_eq "$(echo "$result" | jq '.changed')" "true" "get_persona_version returns changed=true when platform version differs"
+assert_eq "$(echo "$result" | jq '.platform_context_version')" "5" "get_persona_version returns new platform_context_version"
+
+# ── Get persona version — platform_context_version in response ────
+
+describe "apiary_get_persona_version (response includes platform_context_version)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":1},"meta":{},"errors":null}'
+
+result=$(apiary_get_persona_version)
+assert_eq "$(echo "$result" | jq '.platform_context_version')" "1" "get_persona_version response includes platform_context_version"
+
+# ── Check persona version — platform changed triggers exit 0 ──────
+
+describe "apiary_check_persona_version (platform changed, exit 0)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":5,"changed":true},"meta":{},"errors":null}'
+
+set +e
+apiary_check_persona_version -k 3 -p 2
+rc=$?
+set -e
+assert_eq "$rc" "0" "check_persona_version exits 0 when platform context changed"
+
+# ── Check persona version — both unchanged triggers exit 1 ────────
+
+describe "apiary_check_persona_version (both unchanged, exit 1)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":2,"changed":false},"meta":{},"errors":null}'
+
+set +e
+apiary_check_persona_version -k 3 -p 2
+rc=$?
+set -e
+assert_eq "$rc" "1" "check_persona_version exits 1 when persona and platform both unchanged"
+
+# ── CLI: persona-check-version — with -p flag ─────────────────────
+
+describe "apiary-cli persona-check-version (with -p, changed)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":5,"changed":true},"meta":{},"errors":null}'
+
+result=$(_cli_dispatch persona-check-version -k 3 -p 2)
+assert_eq "$result" "changed" "persona-check-version -p prints 'changed' when platform version differs"
+
+describe "apiary-cli persona-check-version (with -p, unchanged)"
+
+mock_reset
+mock_response GET "/api/v1/persona/version" 200 \
+    '{"data":{"version":3,"platform_context_version":2,"changed":false},"meta":{},"errors":null}'
+
+set +e
+result=$(_cli_dispatch persona-check-version -k 3 -p 2)
+rc=$?
+set -e
+assert_eq "$result" "unchanged" "persona-check-version -p prints 'unchanged' when both versions match"
+
 # ── Summary ──────────────────────────────────────────────────────
 
 test_summary

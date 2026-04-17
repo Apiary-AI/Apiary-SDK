@@ -188,11 +188,12 @@ Distributed agents fail in many ways:
 Every task can declare its failure behavior at creation time:
 
 ```json
-POST /api/v1/tasks
+POST /api/v1/hives/{hive}/tasks
 {
   "type": "code_review",
   "target_capability": "code_review",
   "payload": { "pr": 42 },
+  "idempotency_key": "review-pr-42-v1",
   "failure_policy": {
     "task_timeout": 300,
     "progress_timeout": 60,
@@ -200,8 +201,8 @@ POST /api/v1/tasks
     "max_retries": 3,
     "retry_delay": "exponential",
     "retry_delay_base": 5,
-    "on_max_retries_exceeded": "fail",
-    "idempotency_key": "review-pr-42-v1"
+    "retry_jitter": true,
+    "on_max_retries_exceeded": "fail"
   }
 }
 ```
@@ -246,6 +247,11 @@ retry_delay: "exponential"   → base * 2^(retry_count - 1)
 retry_delay: "exponential"   → capped by retry_delay_max (default 300s)
 ```
 
+**`retry_jitter`** (boolean, default `true`): When enabled, adds random jitter to
+the computed backoff delay. This prevents the "thundering herd" problem where
+multiple tasks with the same retry schedule all retry at the exact same instant.
+Set to `false` for deterministic backoff timing (useful in tests).
+
 ### 3.6 What Happens After Max Retries
 
 | Action            | What happens                                              |
@@ -276,6 +282,7 @@ If task doesn't specify `failure_policy`, system defaults apply:
     'retry_delay' => 'exponential',
     'retry_delay_base' => 5,
     'retry_delay_max' => 300,
+    'retry_jitter' => true,
     'on_max_retries_exceeded' => 'fail',
 ],
 ```
@@ -295,9 +302,7 @@ Result: email sent twice, PR merged twice, deployment runs twice.
 {
   "type": "send_email",
   "payload": { "to": "client@acme.com", "subject": "Report" },
-  "failure_policy": {
-    "idempotency_key": "send-report-client-2025-02-20"
-  }
+  "idempotency_key": "send-report-client-2025-02-20"
 }
 ```
 
@@ -344,7 +349,7 @@ Currently: agent must poll all 3 individually in a loop. Wasteful and complex.
 ### 5.2 Solution: `depends_on` + Auto-Trigger
 
 ```json
-POST /api/v1/tasks
+POST /api/v1/hives/{hive}/tasks
 {
   "type": "generate_report",
   "target_capability": "report_generator",
@@ -358,6 +363,20 @@ POST /api/v1/tasks
   }
 }
 ```
+
+**`depends_on` fields:**
+
+| Field                  | Type     | Required | Description                                                     |
+|------------------------|----------|----------|-----------------------------------------------------------------|
+| `tasks`                | array    | Yes      | Task IDs to depend on (1-50 items, each a 26-char ULID string) |
+| `policy`               | string   | No       | `all` (default) or `any`                                        |
+| `inject_results`       | boolean  | No       | Inject dependency results into payload (default `false`)        |
+| `on_dependency_failure` | string  | No       | `fail` (default), `partial`, or `wait`                          |
+
+> **Constraint:** `depends_on` and `children` (fan-out) are **mutually exclusive**.
+> A task cannot declare both -- the API enforces this with a validation error.
+> The two features operate at different levels: fan-out creates subtasks under a
+> parent, while `depends_on` waits on existing tasks created elsewhere.
 
 What happens:
 1. Task created with status `waiting` (new status — not in queue yet)
@@ -492,14 +511,14 @@ This is a **mini-workflow** defined entirely in task config — no workflow engi
                                      ┌──────────────────────────────┘    │         │ back to
                                      │                                   │         │ pending
                                      ▼                                   │         │
-                                ┌──────────┐    needs         ┌─────────▼──┐      │
-                                │completed │    approval       │ awaiting   │      │
-                                └──────────┘                  │ _approval  │      │
-                                                              └─────┬──┬───┘      │
-                                ┌──────────┐                        │  │           │
-                                │cancelled │    denied              │  │ approved  │
-                                └──────────┘◂───────────────────────┘  └──▸ (proxy │
-                                                                          executes)│
+                                ┌──────────┐     agent reports failure   │         │
+                                │completed │          ┌─────────────────┘         │
+                                └──────────┘          │                            │
+                                                      ▼                            │
+                                ┌──────────┐     ┌──────────┐                      │
+                                │cancelled │     │  failed   │                      │
+                                └──────────┘     └──────────┘                      │
+                                                                                   │
                                 ┌──────────┐                                       │
                                 │dead_     │◂──── max_retries exceeded ────────────┘
                                 │letter    │      with on_exceeded: dead_letter
@@ -515,14 +534,19 @@ This is a **mini-workflow** defined entirely in task config — no workflow engi
          └──────────┘
 ```
 
+> **Note on approvals:** The approval mechanism (`approval_request`) exists for
+> proxy actions, but tasks do **not** have a separate `awaiting_approval` status.
+> A task remains `in_progress` while its agent awaits human approval for a proxy
+> action. The `on_timeout: notify` action similarly keeps the task `in_progress`
+> and creates an `approval_request` for a human.
+
 ### 6.2 Status Summary
 
 | Status               | Meaning                                          | Transitions to              |
 |----------------------|--------------------------------------------------|-----------------------------|
 | `waiting`            | Has unmet dependencies                           | pending, failed             |
-| `pending`            | In queue, ready to be claimed                    | claimed/in_progress, expired|
+| `pending`            | In queue, ready to be claimed                    | in_progress, expired        |
 | `in_progress`        | Agent is working on it                           | completed, failed, retry    |
-| `awaiting_approval`  | Proxy action needs human approval                | in_progress, cancelled      |
 | `awaiting_children`  | Parent waiting for child tasks                   | completed, failed           |
 | `completed`          | Done successfully                                | (terminal)                  |
 | `failed`             | Failed permanently                               | (terminal)                  |
@@ -703,8 +727,11 @@ ALTER TABLE tasks ADD COLUMN failure_policy JSONB DEFAULT '{}';
 -- {
 --   task_timeout, progress_timeout, on_timeout,
 --   max_retries, retry_delay, retry_delay_base, retry_delay_max,
---   on_max_retries_exceeded, idempotency_key
+--   retry_jitter, on_max_retries_exceeded
 -- }
+
+ALTER TABLE tasks ADD COLUMN idempotency_key VARCHAR(255) DEFAULT NULL;
+-- Top-level field, not inside failure_policy
 
 ALTER TABLE tasks ADD COLUMN completion_policy JSONB DEFAULT NULL;
 -- {
@@ -733,8 +760,10 @@ ALTER TABLE tasks ADD COLUMN on_complete JSONB DEFAULT NULL;
 
 ALTER TABLE tasks ADD COLUMN depends_on JSONB DEFAULT NULL;
 -- {
---   tasks: [...], policy: all|any, inject_results: bool,
---   on_dependency_failure: fail|partial|wait
+--   tasks: [string(26), ...] (required, 1-50 items),
+--   policy: all|any (optional, default all),
+--   inject_results: bool (optional),
+--   on_dependency_failure: fail|partial|wait (optional, default fail)
 -- }
 -- (task list also normalised into task_dependencies table for indexed queries)
 ```
@@ -991,15 +1020,24 @@ Then evaluate `completion_policy` to decide if parent should complete/fail.
 
 ### 11.1 Create Task (expanded)
 
+> **Note:** All task API paths are hive-scoped: `/api/v1/hives/{hive}/tasks/...`
+> The simplified `/api/v1/tasks/...` form shown in earlier sections is shorthand.
+
 ```json
-POST /api/v1/tasks
+POST /api/v1/hives/{hive}/tasks
 {
   "type": "code_review",
+  "delivery_mode": "default",
   "target_capability": "code_review",
   "payload": { "pr": 42 },
-  
+  "invoke": {
+    "instructions": "Review this PR for security issues",
+    "context": { "repo": "acme/api" }
+  },
+
+  "idempotency_key": "review-pr-42",
   "guarantee": "at_least_once",
-  
+
   "failure_policy": {
     "task_timeout": 600,
     "progress_timeout": 120,
@@ -1007,17 +1045,28 @@ POST /api/v1/tasks
     "max_retries": 3,
     "retry_delay": "exponential",
     "retry_delay_base": 10,
-    "on_max_retries_exceeded": "dead_letter",
-    "idempotency_key": "review-pr-42"
+    "retry_jitter": true,
+    "on_max_retries_exceeded": "dead_letter"
   },
+
+  "thread_id": null,
+  "context_message": null,
 
   "children": [ /* optional fan-out */ ],
   "completion_policy": { /* optional, for parent tasks */ },
-  "depends_on": { /* optional, declarative dependencies */ },
+  "depends_on": { /* optional, declarative dependencies — mutually exclusive with children */ },
   "on_complete": { /* optional, auto-spawn follow-up */ },
   "expires_at": null
 }
 ```
+
+| Field             | Type    | Description                                                        |
+|-------------------|---------|--------------------------------------------------------------------|
+| `delivery_mode`   | string  | `default` or `stream`                                              |
+| `invoke`          | object  | Control-plane instructions: `instructions` (string) and `context`  |
+| `idempotency_key` | string  | Top-level dedup key (max 255 chars). **Not** inside `failure_policy` |
+| `thread_id`       | string  | Link task to an existing thread (26-char ULID)                     |
+| `context_message` | string  | Optional message to append to the thread (max 10,000 chars)       |
 
 All new fields are **optional**. Omitted → system defaults. Existing agents keep working with zero changes.
 
@@ -1073,8 +1122,6 @@ Kanban columns updated:
 
 ```
 Waiting → Pending → In Progress → Completed
-                         │
-                    Awaiting Approval
                          │
               Failed / Dead Letter / Expired
 ```

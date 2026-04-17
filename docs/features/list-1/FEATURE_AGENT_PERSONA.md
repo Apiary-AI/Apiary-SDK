@@ -57,6 +57,7 @@ A persona consists of **named documents** — markdown files with specific roles
 | `RULES`     | Hard constraints, do/don't rules              | "NEVER approve PRs that modify .env files. ALWAYS flag SQL queries without parameterization..." |
 | `STYLE`     | Output format, communication style            | "Write review comments in this format: [SEVERITY] file:line — description..." |
 | `EXAMPLES`  | Few-shot examples of good behavior            | "Example good review comment: [MAJOR] auth.py:42 — SQL injection risk..." |
+| `NOTES`     | Working notes, scratchpad, internal annotations | "TODO: investigate flaky test in auth module. Learned: users table has soft-delete column..." |
 
 All documents are optional. An agent can have just `SOUL` and `AGENT`, or the full set.
 
@@ -109,6 +110,8 @@ When an agent initializes an LLM call, the SDK assembles a system prompt from pe
 [STYLE.md content]
 
 [EXAMPLES.md content]
+
+[NOTES.md content]
 
 [MEMORY.md content]
 
@@ -173,7 +176,7 @@ Each version is a **complete snapshot** — all documents + config at that point
 ### 4.3 Diff Between Versions
 
 ```json
-GET /api/v1/agents/{id}/persona/diff?from=6&to=7
+GET /dashboard/agents/{agent}/persona/diff?from=6&to=7
 
 {
   "from_version": 6,
@@ -193,7 +196,7 @@ Dashboard renders this as a visual diff (like GitHub PR diff view).
 ### 4.4 Rollback
 
 ```json
-POST /api/v1/agents/{id}/persona/rollback
+POST /dashboard/agents/{agent}/persona/rollback
 {
   "to_version": 5,
   "reason": "v6-v7 changes caused too many false positives in security reviews"
@@ -230,6 +233,7 @@ GET /api/v1/tasks/poll
 {
   "tasks": [...],
   "persona_version": 7,
+  "platform_context_version": 2,
   "next_poll_ms": 3000
 }
 ```
@@ -269,77 +273,106 @@ Some agents should NOT auto-update — production agents that need tested person
 
 ### 5.3 Staged Rollout
 
-For agents with multiple replicas:
+For agents with multiple replicas, rollout is managed via `PersonaRolloutService` with the following lifecycle methods:
 
-```json
-POST /api/v1/agents/{id}/persona/promote
-{
-  "version": 8,
-  "strategy": "canary",
-  "canary_percentage": 20,
-  "auto_promote_after": 3600,
-  "rollback_on": {
-    "error_rate_above": 0.1,
-    "avg_rating_below": 3.5
-  }
-}
+- `startCanary(persona, percentage)` — Begin canary rollout at a given percentage (1-99)
+- `promote(persona, percentage)` — Increase rollout percentage (moves status to `rolling`; auto-completes at 100%)
+- `pause(persona)` — Pause the rollout, freezing the current percentage
+- `complete(persona)` — Set to 100% stable
+- `rollback(persona)` — Emergency stop: set to 0% and pause
+- `resume(persona)` — Resume a paused rollout (restores `canary` or `rolling` status based on percentage)
+
+Cohort assignment is **deterministic** using CRC32: `crc32(agent_id + ':' + persona_id) % 100 < rollout_percentage`. The same agent always maps to the same cohort for a given persona version.
+
+**Rollout columns on `agent_personas` table:**
+
+| Column               | Type                                              |
+|----------------------|---------------------------------------------------|
+| `rollout_percentage` | INTEGER (0-100, default 100)                      |
+| `rollout_status`     | VARCHAR — `stable`, `canary`, `rolling`, `paused` |
+| `promoted_at`        | TIMESTAMP (nullable)                              |
+| `paused_at`          | TIMESTAMP (nullable)                              |
+
+**Dashboard routes:**
+
+```
+POST /dashboard/agents/{agent}/persona/rollout/start    — Start canary
+POST /dashboard/agents/{agent}/persona/rollout/promote  — Increase percentage
+POST /dashboard/agents/{agent}/persona/rollout/pause    — Pause rollout
+POST /dashboard/agents/{agent}/persona/rollout/complete — Complete to 100% stable
+POST /dashboard/agents/{agent}/persona/rollout/rollback — Emergency rollback to 0%
+POST /dashboard/agents/{agent}/persona/rollout/resume   — Resume paused rollout
 ```
 
-1. 20% of agent replicas get persona v8
-2. 80% stay on v7
-3. After 1 hour, if metrics look good → auto-promote to 100%
-4. If error rate spikes → auto-rollback to v7
+Example flow:
+
+1. Start canary at 10%: 10% of agent replicas get persona v8, 90% stay on previous stable version
+2. Promote to 50%: half of replicas now serve v8
+3. If metrics degrade: pause or rollback
+4. If metrics look good: complete to 100%
 
 ---
 
-## 6. A/B Testing
+## 6. A/B Testing (Persona Experiments)
 
-### 6.1 Compare Persona Versions
+Experiments are managed through the dashboard via `PersonaExperimentController` and backed by `PersonaExperimentService`. The actual table is `persona_experiments`.
 
-Two versions running simultaneously on different replicas, same tasks:
+### 6.1 Create an Experiment
 
-```json
-POST /api/v1/agents/{id}/persona/ab-test
+Experiments compare two persona versions by splitting traffic between them. Created from the dashboard:
+
+```
+POST /dashboard/experiments
 {
-  "variant_a": { "version": 7 },
-  "variant_b": { "version": 8 },
-  "split": 50,
-  "duration_hours": 24,
-  "metrics": ["task_completion_rate", "avg_duration", "human_rating"]
+  "name": "Security-focused review vs baseline",
+  "agent_id": "01HXY...",          (optional — null for hive-wide)
+  "persona_a_id": "01HXY...",      (FK to agent_personas.id)
+  "persona_b_id": "01HXZ...",      (FK to agent_personas.id)
+  "traffic_split": 50              (% of traffic routed to B)
 }
 ```
 
-Agent Runtime assigns variant A or B to each replica. Tasks are distributed evenly.
+Only one running experiment is allowed per agent (or per hive if agent_id is null). The service uses application-level locking to prevent concurrent creation races.
+
+Agent cohort assignment is **deterministic** using CRC32: `crc32(agent_id + ':' + experiment_id) % 100 < traffic_split`. The same agent always maps to the same bucket for a given experiment.
 
 ### 6.2 Results
 
-```json
-GET /api/v1/agents/{id}/persona/ab-test/results
+Results are computed on-the-fly by `PersonaExperimentService::getResults()`, which aggregates task metrics attributed to the experiment via the `persona_experiment_id` column on the `tasks` table:
 
+```json
 {
-  "status": "running",
-  "duration": "18h / 24h",
-  "variant_a": {
-    "version": 7,
-    "tasks_completed": 45,
-    "avg_task_duration": 38,
-    "error_rate": 0.02,
-    "human_ratings": { "avg": 4.2, "count": 12 }
+  "a": {
+    "requests": 45,
+    "avg_latency": 38.2,
+    "success_rate": 0.98
   },
-  "variant_b": {
-    "version": 8,
-    "tasks_completed": 42,
-    "avg_task_duration": 41,
-    "error_rate": 0.01,
-    "human_ratings": { "avg": 4.6, "count": 11 }
+  "b": {
+    "requests": 42,
+    "avg_latency": 41.1,
+    "success_rate": 0.99
   },
-  "recommendation": "Variant B (v8) shows lower error rate and higher human ratings. Consider promoting."
+  "winner_suggestion": "b"
 }
 ```
 
+The `winner_suggestion` is derived automatically: if both sides have data and success rates differ by more than 1%, the higher rate wins; if within 1%, the side with more requests is suggested.
+
 Dashboard shows side-by-side comparison with charts.
 
-### 6.3 Integration with Task Replay
+### 6.3 Experiment Lifecycle
+
+```
+POST   /dashboard/experiments                          — Create experiment
+GET    /dashboard/experiments                          — List experiments (filterable by ?status=)
+GET    /dashboard/experiments/{experiment}              — View experiment with results
+PATCH  /dashboard/experiments/{experiment}/pause        — Pause running experiment
+PATCH  /dashboard/experiments/{experiment}/resume       — Resume paused experiment
+POST   /dashboard/experiments/{experiment}/winner       — Declare winner (completes experiment)
+DELETE /dashboard/experiments/{experiment}              — Delete (only if not running)
+```
+
+### 6.4 Integration with Task Replay
 
 Replay the same task with different persona versions:
 
@@ -439,23 +472,23 @@ If you encounter code you don't understand:
 - Console.log / dd() / var_dump() → flag for cleanup
 ```
 
-### 7.3 Fork & Customize
+### 7.3 Install & Customize
 
-```json
-POST /api/v1/agents/{id}/persona/from-template
+Templates live in the persona marketplace. Two install paths are available:
+
+**Install to existing agent** (apply marketplace persona to the calling agent):
+
+```
+POST /api/v1/hives/{hive}/persona-marketplace/{persona}/install
 {
-  "template": "code-reviewer",
-  "customizations": {
-    "MEMORY": "## Project: Apiary\n- Framework: Laravel 12\n- Database: PostgreSQL 16\n- Style: PSR-12\n- All models use ULIDs\n- Auth uses Sanctum tokens",
-    "RULES": {
-      "append": "\n## Project-specific rules\n- All Eloquent models MUST use BelongsToHive trait\n- API responses MUST follow { data, meta, errors } envelope"
-    },
-    "config": {
-      "llm": { "model": "claude-sonnet-4-5-20250514" },
-      "review": { "max_files": 30 }
-    }
-  }
+  "message": "Installed code-reviewer template"
 }
+```
+
+**Install as new managed agent** (create a new agent in the hive from the template):
+
+```
+POST /api/v1/hives/{hive}/persona-marketplace/{persona}/install-agent
 ```
 
 Start from template, add project-specific context. Template updates don't overwrite customizations (fork model, not sync).
@@ -529,7 +562,7 @@ while True:
 Take this further: Apiary ships a **generic managed agent runtime** that needs zero custom code. Just configure persona + capabilities in dashboard.
 
 ```json
-POST /api/v1/managed-agents
+POST /api/v1/hives/{hive}/managed-agents
 {
   "name": "code-reviewer",
   "source": {
@@ -550,55 +583,80 @@ Generic agent runtime: poll → read task → assemble persona + task context �
 
 ## 9. API
 
-### 9.1 Persona CRUD
+### 9.1 Dashboard: Persona CRUD
+
+These are dashboard (web) routes, not agent-facing API routes. Managed via `PersonaDashboardController`.
 
 ```
-GET    /api/v1/agents/{id}/persona              — Get current active persona (all docs + config)
-PUT    /api/v1/agents/{id}/persona              — Update persona (creates new version)
-PATCH  /api/v1/agents/{id}/persona/documents/{name} — Update single document
-PATCH  /api/v1/agents/{id}/persona/config       — Update config only
+GET    /dashboard/agents/{agent}/persona                     — Get current active persona (all docs + config)
+PUT    /dashboard/agents/{agent}/persona                     — Update persona (creates new version)
+PATCH  /dashboard/agents/{agent}/persona/documents/{name}    — Update single document
+PATCH  /dashboard/agents/{agent}/persona/config              — Update config only
 ```
 
-### 9.2 Versioning
+### 9.2 Dashboard: Versioning
 
 ```
-GET    /api/v1/agents/{id}/persona/versions     — List all versions with metadata
-GET    /api/v1/agents/{id}/persona/versions/{v}  — Get specific version
-GET    /api/v1/agents/{id}/persona/diff?from={v1}&to={v2} — Diff between versions
-POST   /api/v1/agents/{id}/persona/rollback     — Rollback to version
-POST   /api/v1/agents/{id}/persona/promote      — Promote version (staged/canary)
+GET    /dashboard/agents/{agent}/persona/versions            — List all versions with metadata
+GET    /dashboard/agents/{agent}/persona/versions/{version}  — Get specific version
+GET    /dashboard/agents/{agent}/persona/diff?from={v1}&to={v2} — Diff between versions
+POST   /dashboard/agents/{agent}/persona/rollback            — Rollback to version
+POST   /dashboard/agents/{agent}/persona/promote             — Promote version (staged/canary)
+GET    /dashboard/agents/{agent}/persona/tokens              — Token count breakdown
+GET    /dashboard/agents/{agent}/persona/performance         — Performance metrics per version
 ```
 
-### 9.3 A/B Testing
+### 9.3 Dashboard: Persona Experiments (A/B Testing)
+
+Managed via `PersonaExperimentController` at dashboard routes:
 
 ```
-POST   /api/v1/agents/{id}/persona/ab-test      — Start A/B test
-GET    /api/v1/agents/{id}/persona/ab-test/results — Get results
-POST   /api/v1/agents/{id}/persona/ab-test/stop — Stop test, pick winner
+GET    /dashboard/experiments                          — List experiments
+POST   /dashboard/experiments                          — Create experiment
+GET    /dashboard/experiments/{experiment}              — View experiment + results
+PATCH  /dashboard/experiments/{experiment}/pause        — Pause experiment
+PATCH  /dashboard/experiments/{experiment}/resume       — Resume experiment
+POST   /dashboard/experiments/{experiment}/winner       — Declare winner
+DELETE /dashboard/experiments/{experiment}              — Delete experiment
 ```
 
-### 9.4 Templates
+### 9.4 Persona Marketplace (Templates)
+
+Agent-facing API routes via `PersonaMarketplaceApiController`:
 
 ```
-GET    /api/v1/persona-templates                — List available templates
-GET    /api/v1/persona-templates/{slug}         — Get template details
-POST   /api/v1/agents/{id}/persona/from-template — Create persona from template
+GET    /api/v1/hives/{hive}/persona-marketplace                     — List marketplace personas
+GET    /api/v1/hives/{hive}/persona-marketplace/{persona}           — Get marketplace persona details
+POST   /api/v1/hives/{hive}/persona-marketplace/{persona}/install        — Install to calling agent
+POST   /api/v1/hives/{hive}/persona-marketplace/{persona}/install-agent  — Install as new managed agent
+```
+
+Legacy backward-compatible routes (agent-templates):
+
+```
+GET    /api/v1/hives/{hive}/agent-templates                         — List (legacy format)
+GET    /api/v1/hives/{hive}/agent-templates/{persona}               — Show (legacy format)
+POST   /api/v1/hives/{hive}/agent-templates/{persona}/install       — Install as new agent (legacy)
 ```
 
 ### 9.5 Agent SDK Endpoint
 
+Agent-facing API routes (authenticated via `sanctum-agent`):
+
 ```
-GET    /api/v1/persona                          — Get MY persona (agent auth, returns policy-selected version: active for auto, pinned for manual, canary-assigned for staged)
+GET    /api/v1/persona                          — Get MY persona (agent auth, returns policy-selected version: active for auto, pinned for manual, canary-assigned for staged). Includes platform_context and platform_context_version.
 GET    /api/v1/persona/config                   — Get config only
 GET    /api/v1/persona/documents/{name}         — Get single document
-GET    /api/v1/persona/assembled                — Get pre-assembled system prompt string
+GET    /api/v1/persona/assembled                — Get pre-assembled system prompt string (includes platform context)
+GET    /api/v1/persona/version                  — Get current version number + platform_context_version; supports ?known_version= and ?known_platform_version= query params to detect changes
 PATCH  /api/v1/persona/documents/{name}         — Update single document (agent self-update, respects lock policy)
+PATCH  /api/v1/persona/memory                   — Shortcut for updating MEMORY document (agent self-update)
 ```
 
 ### 9.6 Update Persona (Full Example)
 
 ```json
-PUT /api/v1/agents/agt_reviewer/persona
+PUT /dashboard/agents/agt_reviewer/persona
 {
   "message": "Added security focus and updated project memory",
   "documents": {
@@ -651,20 +709,24 @@ Response:
 
 Some documents should be editable by agents (MEMORY evolves as project evolves). Others should be locked (RULES set by humans, agents can't weaken their own constraints).
 
+Documents are either **locked** or **unlocked** — a simple boolean check via `AgentPersona::isDocumentLocked()`. The lock state is determined from two sources:
+
+1. The `locked` field within the document entry in the `documents` JSONB column
+2. The `lock_policy` JSONB column on the persona
+
 ```json
 {
   "documents": {
-    "SOUL":     { "locked": true,  "editable_by": ["human"] },
-    "AGENT":    { "locked": true,  "editable_by": ["human"] },
-    "MEMORY":   { "locked": false, "editable_by": ["human", "agent", "self"] },
-    "RULES":    { "locked": true,  "editable_by": ["human"] },
-    "STYLE":    { "locked": true,  "editable_by": ["human"] },
-    "EXAMPLES": { "locked": false, "editable_by": ["human", "agent"] }
+    "SOUL":     { "content": "...", "locked": true },
+    "AGENT":    { "content": "...", "locked": true },
+    "MEMORY":   { "content": "...", "locked": false },
+    "RULES":    { "content": "...", "locked": true },
+    "STYLE":    { "content": "...", "locked": true },
+    "EXAMPLES": { "content": "...", "locked": false },
+    "NOTES":    { "content": "...", "locked": false }
   }
 }
 ```
-
-`self` — the agent itself can update its own MEMORY (learning from experience).
 
 Agent updates to MEMORY:
 
@@ -675,9 +737,18 @@ PATCH /api/v1/persona/documents/MEMORY
 }
 ```
 
+Or use the shortcut endpoint:
+
+```json
+PATCH /api/v1/persona/memory
+{
+  "append": "\n## Learned 2025-02-20\n- Team prefers early returns over nested if-else"
+}
+```
+
 Creates new persona version. Dashboard shows "Agent updated MEMORY" in version history with clear attribution.
 
-Locked documents: API returns 403 if agent tries to modify a locked document. Human must unlock first.
+Locked documents: API returns 403 if agent tries to modify a locked document. Human must unlock first via the dashboard.
 
 ---
 
@@ -717,6 +788,12 @@ CREATE TABLE agent_personas (
     avg_rating      FLOAT,
     error_rate      FLOAT,
     
+    -- Rollout control
+    rollout_percentage INTEGER DEFAULT 100,
+    rollout_status  VARCHAR(20) DEFAULT 'stable',  -- stable, canary, rolling, paused
+    promoted_at     TIMESTAMP,
+    paused_at       TIMESTAMP,
+    
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
@@ -725,29 +802,31 @@ CREATE UNIQUE INDEX idx_persona_active ON agent_personas (agent_id)
 CREATE INDEX idx_persona_versions ON agent_personas (agent_id, version DESC);
 CREATE UNIQUE INDEX idx_persona_version_unique ON agent_personas (agent_id, version);
 
--- A/B tests
-CREATE TABLE persona_ab_tests (
-    id              VARCHAR(26) PRIMARY KEY,
-    agent_id        VARCHAR(26) NOT NULL REFERENCES agents(id),
-    
-    variant_a       INTEGER NOT NULL,        -- persona version (validated by app against agent_personas)
-    variant_b       INTEGER NOT NULL,        -- persona version (validated by app against agent_personas)
-    CONSTRAINT fk_variant_a FOREIGN KEY (agent_id, variant_a) REFERENCES agent_personas(agent_id, version),
-    CONSTRAINT fk_variant_b FOREIGN KEY (agent_id, variant_b) REFERENCES agent_personas(agent_id, version),
-    CONSTRAINT chk_distinct_variants CHECK (variant_a <> variant_b),
-    split           SMALLINT DEFAULT 50 CHECK (split BETWEEN 0 AND 100),
-    
-    status          VARCHAR(20) DEFAULT 'running',  -- running, completed, stopped
-    started_at      TIMESTAMP DEFAULT NOW(),
-    ends_at         TIMESTAMP,
-    
-    results_a       JSONB DEFAULT '{}',
-    results_b       JSONB DEFAULT '{}',
-    winner          VARCHAR(1),              -- 'a', 'b', or null
-    
-    created_by      VARCHAR(26) NOT NULL,
-    created_at      TIMESTAMP DEFAULT NOW()
+-- A/B tests (persona experiments)
+CREATE TABLE persona_experiments (
+    id                  VARCHAR(26) PRIMARY KEY,   -- ULID
+    apiary_id           VARCHAR(26) NOT NULL REFERENCES apiaries(id) ON DELETE CASCADE,
+    hive_id             VARCHAR(26) NOT NULL REFERENCES hives(id) ON DELETE CASCADE,
+    agent_id            VARCHAR(26) REFERENCES agents(id) ON DELETE SET NULL,  -- null = hive-wide
+
+    name                VARCHAR(255) NOT NULL,
+    status              VARCHAR(20) DEFAULT 'running',  -- running, paused, completed
+
+    persona_a_id        VARCHAR(26) NOT NULL REFERENCES agent_personas(id) ON DELETE CASCADE,
+    persona_b_id        VARCHAR(26) NOT NULL REFERENCES agent_personas(id) ON DELETE CASCADE,
+
+    traffic_split       SMALLINT DEFAULT 50,       -- % of traffic routed to B
+
+    winner_persona_id   VARCHAR(26) REFERENCES agent_personas(id) ON DELETE SET NULL,
+
+    started_at          TIMESTAMP,
+    ended_at            TIMESTAMP,
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW()
 );
+
+CREATE INDEX idx_experiments_scope ON persona_experiments (apiary_id, hive_id, status);
+CREATE INDEX idx_experiments_agent ON persona_experiments (agent_id, status);
 ```
 
 Agents table addition:
@@ -780,8 +859,9 @@ ALTER TABLE agents ADD COLUMN persona_pinned_version INTEGER;
 │  │  ⚡ RULES 🔒  │  │  10+ years of experience.                │   │
 │  │  🎨 STYLE 🔒  │  │                                           │   │
 │  │  📝 EXAMPLES │  │  Your core values:                        │   │
-│  │              │  │  - **Security first**: Always look for    │   │
-│  │  ⚙️ CONFIG   │  │    vulnerabilities                        │   │
+│  │  📓 NOTES   │  │  - **Security first**: Always look for    │   │
+│  │              │  │    vulnerabilities                        │   │
+│  │  ⚙️ CONFIG   │  │                                           │   │
 │  │              │  │  - **Readability**: Code should be clear  │   │
 │  └──────────────┘  │    to the next developer                  │   │
 │                    │  - **Pragmatism**: Perfect is the enemy   │   │
@@ -818,10 +898,11 @@ MEMORY:    840 tokens
 RULES:     290 tokens
 STYLE:     180 tokens
 EXAMPLES:  450 tokens
+NOTES:     120 tokens
 ─────────────────────
-Total:     2,660 tokens
+Total:     2,780 tokens
 
-Estimated cost per task: ~$0.008 (input) + ~$0.012 (output) = $0.02
+Estimated cost per task: ~$0.009 (input) + ~$0.012 (output) = $0.02
 Monthly estimate (500 tasks): ~$10
 ```
 
@@ -853,7 +934,7 @@ Agent overview card now shows persona summary:
 ┌────────────────────────────────────────────────┐
 │  🤖 code-reviewer         🟢 online             │
 │                                                 │
-│  Persona: v7 (auto-update)  📜 6 docs  ⚙️ config│
+│  Persona: v7 (auto-update)  📜 7 docs  ⚙️ config│
 │  Identity: "Senior code reviewer, security-first" │
 │  Model: claude-sonnet-4-5 @ temp 0.3           │
 │                                                 │
@@ -919,7 +1000,7 @@ POST /api/v1/tasks/{id}/replay
 
 ### 13.4 Persona + LLM Cost Tracking
 
-Persona token count feeds into cost estimation. Dashboard shows: "This persona uses 2,660 input tokens per call. At current task volume (500/mo), system prompt costs ~$10/mo."
+Persona token count feeds into cost estimation. Dashboard shows: "This persona uses 2,780 input tokens per call. At current task volume (500/mo), system prompt costs ~$10/mo."
 
 ### 13.5 Persona + Channels
 
@@ -980,4 +1061,4 @@ P0+P1 (usable MVP): ~2.5 weeks. Recommended phase: **Phase 2** — early, becaus
 ---
 
 *Feature version: 1.0*
-*Depends on: PRODUCT.md v4.0 (agents, hives), FEATURE_MANAGED_AGENTS.md (managed deployment), FEATURE_PLATFORM_ENHANCEMENTS.md (LLM tracking, replay)*
+*Depends on: PRODUCT.md v4.0 (agents, hives), FEATURE_HOSTED_AGENTS.md (hosted deployment on novps.io), FEATURE_PLATFORM_ENHANCEMENTS.md (LLM tracking, replay)*

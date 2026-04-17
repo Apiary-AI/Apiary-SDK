@@ -7,6 +7,10 @@ from typing import Any
 import httpx
 
 from apiary_sdk.exceptions import ApiaryError, raise_for_status
+from apiary_sdk.models import Event
+
+#: Valid channel types accepted by the API.
+CHANNEL_TYPES: list[str] = ["discussion", "review", "planning", "incident"]
 
 
 class ApiaryClient:
@@ -159,6 +163,7 @@ class ApiaryClient:
 
         data = self._request("POST", "/api/v1/agents/register", json=payload)
         self.token = data["token"]
+        self._event_cursors: dict[str, str] = {}
         return data
 
     def login(self, *, agent_id: str, secret: str) -> dict[str, Any]:
@@ -169,6 +174,7 @@ class ApiaryClient:
             json={"agent_id": agent_id, "secret": secret},
         )
         self.token = data["token"]
+        self._event_cursors: dict[str, str] = {}
         return data
 
     def logout(self) -> None:
@@ -177,6 +183,7 @@ class ApiaryClient:
             self._request("POST", "/api/v1/agents/logout")
         finally:
             self.token = None
+            self._event_cursors: dict[str, str] = {}
 
     def me(self) -> dict[str, Any]:
         """Return the currently authenticated agent's profile."""
@@ -358,16 +365,21 @@ class ApiaryClient:
 
         Unlike :meth:`poll_tasks`, this method returns the full
         ``{data, meta, errors}`` envelope so callers can inspect
-        ``meta["persona_version"]`` and react to persona changes without
-        issuing a separate request.
+        ``meta["persona_version"]`` and ``meta["platform_context_version"]``
+        and react to persona or platform context changes without issuing a
+        separate request.
 
         Example::
 
             envelope = client.poll_tasks_with_meta(hive_id)
             tasks = envelope["data"]
-            server_persona_version = envelope.get("meta", {}).get("persona_version")
+            meta = envelope.get("meta", {})
+            server_persona_version = meta.get("persona_version")
+            server_platform_version = meta.get("platform_context_version")
             if server_persona_version != my_cached_version:
                 persona = client.get_persona()  # refresh local cache
+            if server_platform_version != my_cached_platform_version:
+                persona = client.get_persona()  # includes platform_context
         """
         params: dict[str, Any] = {}
         if capability is not None:
@@ -714,6 +726,289 @@ class ApiaryClient:
         self._request("DELETE", f"/api/v1/hives/{hive_id}/knowledge/{entry_id}")
 
     # ------------------------------------------------------------------
+    # Knowledge links
+    # ------------------------------------------------------------------
+
+    def create_knowledge_link(
+        self,
+        hive_id: str,
+        entry_id: str,
+        *,
+        target_id: str | None = None,
+        target_type: str = "knowledge",
+        target_ref: str | None = None,
+        link_type: str = "relates_to",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a link from a knowledge entry to another entity.
+
+        Args:
+            hive_id: Hive that owns the source entry.
+            entry_id: ID of the source knowledge entry.
+            target_id: ID of the target knowledge entry (required when
+                *target_type* is ``"knowledge"``).
+            target_type: Type of the target entity — ``"knowledge"``
+                (default), ``"task"``, ``"channel"``, or ``"agent"``.
+            target_ref: Reference identifier for non-knowledge targets.
+            link_type: Relationship type — ``"relates_to"`` (default),
+                ``"depends_on"``, ``"supersedes"``, ``"derived_from"``,
+                ``"decided_in"``, ``"implemented_by"``, ``"authored_by"``,
+                or ``"part_of"``.
+            metadata: Optional JSONB metadata attached to the link.
+
+        Returns:
+            The created link dict.
+        """
+        body: dict[str, Any] = {
+            "target_type": target_type,
+            "link_type": link_type,
+        }
+        if target_id is not None:
+            body["target_id"] = target_id
+        if target_ref is not None:
+            body["target_ref"] = target_ref
+        if metadata is not None:
+            body["metadata"] = metadata
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/knowledge/{entry_id}/links",
+            json=body,
+        )
+
+    def list_knowledge_links(
+        self,
+        hive_id: str,
+        *,
+        source_id: str | None = None,
+        target_id: str | None = None,
+        target_type: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List knowledge links filtered by source or target.
+
+        Either *source_id* or both *target_id* and *target_type* must be
+        provided — the API requires one of the two filter combinations.
+
+        Args:
+            hive_id: Hive to query.
+            source_id: Filter by source knowledge entry ID.
+            target_id: Filter by target reference (used with *target_type*).
+            target_type: Filter by target type (used with *target_id*).
+            limit: Maximum number of links to return (1–100, default 50).
+
+        Returns:
+            List of link dicts.
+        """
+        params: dict[str, Any] = {}
+        if source_id is not None:
+            params["source"] = source_id
+        if target_id is not None:
+            params["target_ref"] = target_id
+        if target_type is not None:
+            params["target_type"] = target_type
+        if limit is not None:
+            params["limit"] = limit
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/links",
+            params=params,
+        )
+
+    def delete_knowledge_link(self, hive_id: str, link_id: str) -> None:
+        """Delete a knowledge link.
+
+        Args:
+            hive_id: Hive that owns the link's source entry.
+            link_id: ID of the link to delete.
+        """
+        self._request(
+            "DELETE",
+            f"/api/v1/hives/{hive_id}/knowledge/links/{link_id}",
+        )
+
+    def confirm_knowledge_link(self, hive_id: str, link_id: str) -> dict[str, Any]:
+        """Confirm a suggested knowledge link.
+
+        Promotes a link with ``status: suggested`` to ``status: confirmed``.
+
+        Args:
+            hive_id: Hive that owns the link's source entry.
+            link_id: ID of the suggested link to confirm.
+
+        Returns:
+            The confirmed link dict.
+        """
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/knowledge/links/{link_id}/confirm",
+        )
+
+    def dismiss_knowledge_link(self, hive_id: str, link_id: str) -> dict[str, Any]:
+        """Dismiss a suggested knowledge link.
+
+        Marks the suggestion as dismissed so it is excluded from future
+        listings.
+
+        Args:
+            hive_id: Hive that owns the link's source entry.
+            link_id: ID of the suggested link to dismiss.
+
+        Returns:
+            The dismissed link dict.
+        """
+        return self._request(
+            "DELETE",
+            f"/api/v1/hives/{hive_id}/knowledge/links/{link_id}/dismiss",
+        )
+
+    def suggested_links(
+        self,
+        hive_id: str,
+        entry_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List suggested (auto-detected) links for a knowledge entry.
+
+        Args:
+            hive_id: Hive that owns the entry.
+            entry_id: ID of the knowledge entry.
+            limit: Maximum number of suggestions to return (1–100, default 50).
+
+        Returns:
+            List of suggested link dicts.
+        """
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/{entry_id}/suggested-links",
+            params=params or None,
+        )
+
+    # ------------------------------------------------------------------
+    # Knowledge graph traversal
+    # ------------------------------------------------------------------
+
+    def get_knowledge_graph(
+        self,
+        hive_id: str,
+        entry_id: str,
+        *,
+        depth: int | None = None,
+        link_types: str | None = None,
+        max_nodes: int | None = None,
+    ) -> dict[str, Any]:
+        """Traverse the knowledge graph starting from an entry.
+
+        Returns a graph structure with nodes and edges reachable from the
+        given entry within the specified depth.
+
+        Args:
+            hive_id: Hive that owns the root entry.
+            entry_id: ID of the root knowledge entry.
+            depth: Maximum traversal depth (1–5, default 2).
+            link_types: Comma-separated list of link types to traverse
+                (e.g. ``"relates_to,depends_on"``). All types if omitted.
+            max_nodes: Maximum number of nodes to return (1–200, default 50).
+
+        Returns:
+            Graph dict with ``nodes`` and ``edges``.
+        """
+        params: dict[str, Any] = {}
+        if depth is not None:
+            params["depth"] = depth
+        if link_types is not None:
+            params["link_types"] = link_types
+        if max_nodes is not None:
+            params["max_nodes"] = max_nodes
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/{entry_id}/graph",
+            params=params or None,
+        )
+
+    # ------------------------------------------------------------------
+    # Knowledge index & health
+    # ------------------------------------------------------------------
+
+    def knowledge_topics(self, hive_id: str) -> dict[str, Any]:
+        """Get the auto-maintained topics index for a hive.
+
+        Returns the ``_index:topics`` knowledge entry containing extracted
+        topic clusters from the hive's knowledge base.
+
+        Args:
+            hive_id: Hive to query.
+
+        Returns:
+            The topics index entry dict.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/index/topics",
+        )
+
+    def knowledge_decisions(self, hive_id: str) -> dict[str, Any]:
+        """Get the auto-maintained decisions index for a hive.
+
+        Returns the ``_index:decisions`` knowledge entry containing extracted
+        decisions from the hive's knowledge base.
+
+        Args:
+            hive_id: Hive to query.
+
+        Returns:
+            The decisions index entry dict.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/index/decisions",
+        )
+
+    def knowledge_by_agent(
+        self,
+        hive_id: str,
+        agent_id: str,
+    ) -> dict[str, Any]:
+        """Get the agent-specific knowledge index.
+
+        Returns the ``_index:agent:{agent_id}`` knowledge entry for the
+        calling agent. Agents can only access their own agent index.
+
+        Args:
+            hive_id: Hive to query.
+            agent_id: ID of the agent (must be the authenticated agent).
+
+        Returns:
+            The agent index entry dict.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/index/agent/{agent_id}",
+        )
+
+    def knowledge_health(self, hive_id: str) -> dict[str, Any]:
+        """Get the knowledge base health score and metrics for a hive.
+
+        Returns a health score (0–100), letter grade, detailed metrics
+        (coverage, freshness, linking density, etc.), and recommendations
+        for improving the knowledge base.
+
+        Args:
+            hive_id: Hive to query.
+
+        Returns:
+            Health dict with ``score``, ``grade``, ``metrics``, and
+            ``recommendations``.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/knowledge/health",
+        )
+
+    # ------------------------------------------------------------------
     # Context threads
     # ------------------------------------------------------------------
 
@@ -898,7 +1193,12 @@ class ApiaryClient:
     # Persona
     # ------------------------------------------------------------------
 
-    def get_persona_version(self, *, known_version: int | None = None) -> dict[str, Any]:
+    def get_persona_version(
+        self,
+        *,
+        known_version: int | None = None,
+        known_platform_version: int | None = None,
+    ) -> dict[str, Any]:
         """Get the server-assigned persona version for this agent.
 
         Lightweight alternative to :meth:`get_persona` — fetches only the version
@@ -908,16 +1208,26 @@ class ApiaryClient:
         Args:
             known_version: If provided, the response will include a ``changed``
                 boolean comparing the server version against this value.
+            known_platform_version: If provided, platform context version changes
+                will also be factored into the ``changed`` flag. Without this,
+                only persona version changes are detected.
 
         Returns:
-            A dict with ``version`` (int | None) and optionally ``changed`` (bool).
+            A dict with ``version`` (int | None), ``platform_context_version``
+            (int | None), and optionally ``changed`` (bool).
         """
         params: dict[str, Any] = {}
         if known_version is not None:
             params["known_version"] = known_version
+        if known_platform_version is not None:
+            params["known_platform_version"] = known_platform_version
         return self._request("GET", "/api/v1/persona/version", params=params or None)
 
-    def check_persona_version(self, known_version: int | None) -> bool:
+    def check_persona_version(
+        self,
+        known_version: int | None,
+        known_platform_version: int | None = None,
+    ) -> bool:
         """Return True if the server-assigned persona version differs from *known_version*.
 
         Calls ``GET /api/v1/persona/version?known_version=N`` and returns the
@@ -927,15 +1237,27 @@ class ApiaryClient:
 
         Args:
             known_version: The version number the agent currently holds locally.
+            known_platform_version: The platform context version the agent
+                currently holds locally. When provided, platform context changes
+                will also trigger a refresh.
 
         Returns:
             True if the persona should be refreshed, False otherwise.
         """
-        result = self.get_persona_version(known_version=known_version)
+        result = self.get_persona_version(
+            known_version=known_version,
+            known_platform_version=known_platform_version,
+        )
         return bool(result.get("changed", False))
 
     def get_persona(self) -> dict[str, Any]:
-        """Get the agent's active persona (policy-selected version)."""
+        """Get the agent's active persona (policy-selected version).
+
+        The response includes ``platform_context`` (str | None) and
+        ``platform_context_version`` (int | None) so agents can access the
+        shared platform SDK knowledge without a separate call to
+        :meth:`get_persona_assembled`.
+        """
         return self._request("GET", "/api/v1/persona")
 
     def get_persona_config(self) -> dict[str, Any]:
@@ -1190,6 +1512,1078 @@ class ApiaryClient:
             page += 1
 
         return results
+
+    # ------------------------------------------------------------------
+    # Workflows
+    # ------------------------------------------------------------------
+
+    def list_workflows(
+        self,
+        hive_id: str,
+        *,
+        page: int = 1,
+        per_page: int = 15,
+        is_active: bool | None = None,
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List workflows in a hive."""
+        params: dict[str, Any] = {"page": page, "per_page": min(per_page, 100)}
+        if is_active is not None:
+            params["is_active"] = "true" if is_active else "false"
+        if search is not None:
+            params["search"] = search
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows",
+            params=params,
+        )
+
+    def get_workflow(self, hive_id: str, workflow_id: str) -> dict[str, Any]:
+        """Get a single workflow by ID."""
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}",
+        )
+
+    def create_workflow(
+        self,
+        hive_id: str,
+        *,
+        slug: str,
+        name: str,
+        steps: dict[str, dict[str, Any]],
+        trigger_config: dict[str, Any] | None = None,
+        description: str | None = None,
+        is_active: bool | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new workflow."""
+        body: dict[str, Any] = {
+            "slug": slug,
+            "name": name,
+            "steps": steps,
+        }
+        if trigger_config is not None:
+            body["trigger_config"] = trigger_config
+        if description is not None:
+            body["description"] = description
+        if is_active is not None:
+            body["is_active"] = is_active
+        if settings is not None:
+            body["settings"] = settings
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/workflows",
+            json=body,
+        )
+
+    def update_workflow(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        *,
+        name: str | None = None,
+        slug: str | None = None,
+        description: str | None = None,
+        steps: dict[str, dict[str, Any]] | None = None,
+        trigger_config: dict[str, Any] | None = None,
+        is_active: bool | None = None,
+        settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Update a workflow. Pass only the fields to change."""
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if slug is not None:
+            body["slug"] = slug
+        if description is not None:
+            body["description"] = description
+        if steps is not None:
+            body["steps"] = steps
+        if trigger_config is not None:
+            body["trigger_config"] = trigger_config
+        if is_active is not None:
+            body["is_active"] = is_active
+        if settings is not None:
+            body["settings"] = settings
+        return self._request(
+            "PUT",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}",
+            json=body,
+        )
+
+    def delete_workflow(self, hive_id: str, workflow_id: str) -> None:
+        """Delete a workflow."""
+        self._request(
+            "DELETE",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}",
+        )
+
+    def run_workflow(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a workflow run."""
+        body: dict[str, Any] = {}
+        if payload is not None:
+            body["payload"] = payload
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/runs",
+            json=body or None,
+        )
+
+    def list_workflow_runs(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        *,
+        page: int = 1,
+        per_page: int = 15,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List runs for a workflow."""
+        params: dict[str, Any] = {
+            "page": page,
+            "per_page": min(per_page, 100),
+        }
+        if status is not None:
+            params["status"] = status
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/runs",
+            params=params,
+        )
+
+    def get_workflow_run(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Get a single workflow run."""
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/runs/{run_id}",
+        )
+
+    def cancel_workflow_run(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Cancel a running workflow run."""
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/runs/{run_id}/cancel",
+        )
+
+    def retry_workflow_run(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        """Retry a failed workflow run."""
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/runs/{run_id}/retry",
+        )
+
+    def list_workflow_versions(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        *,
+        page: int = 1,
+        per_page: int = 15,
+    ) -> list[dict[str, Any]]:
+        """List versions of a workflow."""
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/versions",
+            params={"page": page, "per_page": min(per_page, 100)},
+        )
+
+    def get_workflow_version(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        version: int | str,
+    ) -> dict[str, Any]:
+        """Get a specific workflow version."""
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/versions/{version}",
+        )
+
+    def diff_workflow_versions(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        from_version: int | str,
+        to_version: int | str,
+    ) -> dict[str, Any]:
+        """Diff two workflow versions."""
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}"
+            f"/versions/{from_version}/diff/{to_version}",
+        )
+
+    def rollback_workflow_version(
+        self,
+        hive_id: str,
+        workflow_id: str,
+        version: int | str,
+    ) -> dict[str, Any]:
+        """Rollback a workflow to a specific version."""
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/workflows/{workflow_id}/versions/{version}/rollback",
+        )
+
+    # ------------------------------------------------------------------
+    # Events
+    # ------------------------------------------------------------------
+
+    def subscribe(
+        self,
+        event_type: str,
+        scope: str = "hive",
+    ) -> dict[str, Any]:
+        """Subscribe to an event type.
+
+        Args:
+            event_type: The event type to subscribe to (e.g. ``"task.completed"``).
+            scope: Subscription scope — ``"hive"`` (default) or ``"apiary"``
+                (requires cross-hive permission).
+
+        Returns:
+            The subscription dict.
+        """
+        return self._request(
+            "POST",
+            "/api/v1/agents/subscriptions",
+            json={"event_type": event_type, "scope": scope},
+        )
+
+    def unsubscribe(self, event_type: str) -> None:
+        """Unsubscribe from an event type.
+
+        Args:
+            event_type: The event type to unsubscribe from.
+        """
+        self._request("DELETE", f"/api/v1/agents/subscriptions/{event_type}")
+
+    def list_subscriptions(self) -> list[dict[str, Any]]:
+        """List all event subscriptions for the authenticated agent."""
+        return self._request("GET", "/api/v1/agents/subscriptions")
+
+    def replace_subscriptions(
+        self,
+        subscriptions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Atomically replace all event subscriptions.
+
+        Each entry should have ``event_type`` (str) and optionally ``scope``
+        (``"hive"`` or ``"apiary"``).
+
+        Args:
+            subscriptions: List of subscription dicts to set.
+
+        Returns:
+            The new subscription list.
+        """
+        return self._request(
+            "PUT",
+            "/api/v1/agents/subscriptions",
+            json={"subscriptions": subscriptions},
+        )
+
+    def poll_events(
+        self,
+        hive_id: str,
+        *,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """Poll for new events matching the agent's subscriptions.
+
+        The SDK tracks the cursor (``last_event_id``) internally so callers
+        don't need to manage pagination state.  On each call, events newer
+        than the last seen cursor are returned.  When the response indicates
+        ``has_more``, the method automatically re-polls until all pending
+        events have been fetched.
+
+        Args:
+            hive_id: Hive to poll events from.
+            since: ISO-8601 datetime — only used on the first poll when no
+                cursor has been established yet.
+            limit: Maximum events per server round-trip (default 50).
+
+        Returns:
+            A flat list of :class:`Event` objects accumulated across all pages.
+        """
+        all_events: list[dict[str, Any]] = []
+
+        while True:
+            params: dict[str, Any] = {}
+            cursors = getattr(self, "_event_cursors", {})
+            cursor = cursors.get(hive_id)
+            if cursor is not None:
+                params["last_event_id"] = cursor
+            elif since is not None:
+                params["since"] = since
+            if limit is not None:
+                params["limit"] = limit
+
+            envelope = self._request_envelope(
+                "GET",
+                f"/api/v1/hives/{hive_id}/events/poll",
+                params=params or None,
+            )
+
+            events = envelope.get("data", []) or []
+            meta = envelope.get("meta", {}) or {}
+
+            all_events.extend(events)
+
+            # Update internal cursor from response meta.
+            next_cursor = meta.get("next_cursor")
+            if next_cursor is not None:
+                if not hasattr(self, "_event_cursors"):
+                    self._event_cursors = {}
+                self._event_cursors[hive_id] = next_cursor
+
+            # Re-poll immediately if the server indicates more events.
+            if meta.get("has_more", False):
+                continue
+
+            break
+
+        return [Event.from_dict(e) for e in all_events]
+
+    def poll_events_with_meta(
+        self,
+        hive_id: str,
+        *,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Poll for events and return the full envelope (single page).
+
+        Unlike :meth:`poll_events` (which returns typed :class:`Event`
+        objects), this method returns the **raw API envelope** with event
+        data left as plain ``dict`` objects.  No automatic cursor-based
+        re-polling is performed.  The internal cursor is still updated
+        from the response.
+
+        Args:
+            hive_id: Hive to poll events from.
+            since: ISO-8601 datetime filter.
+            limit: Maximum events to return.
+
+        Returns:
+            The full ``{data, meta, errors}`` envelope where ``data`` is a
+            list of raw event dicts (not :class:`Event` instances).
+        """
+        params: dict[str, Any] = {}
+        cursors = getattr(self, "_event_cursors", {})
+        cursor = cursors.get(hive_id)
+        if cursor is not None:
+            params["last_event_id"] = cursor
+        elif since is not None:
+            params["since"] = since
+        if limit is not None:
+            params["limit"] = limit
+
+        envelope = self._request_envelope(
+            "GET",
+            f"/api/v1/hives/{hive_id}/events/poll",
+            params=params or None,
+        )
+
+        meta = envelope.get("meta", {}) or {}
+        next_cursor = meta.get("next_cursor")
+        if next_cursor is not None:
+            if not hasattr(self, "_event_cursors"):
+                self._event_cursors = {}
+            self._event_cursors[hive_id] = next_cursor
+
+        return envelope
+
+    def publish_event(
+        self,
+        hive_id: str,
+        *,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Publish an event to the EventBus.
+
+        Args:
+            hive_id: Hive to publish the event in.
+            event_type: Event type string (e.g. ``"task.completed"``).
+            payload: Optional event payload dict.
+
+        Returns:
+            The created event dict.
+        """
+        body: dict[str, Any] = {"type": event_type}
+        if payload is not None:
+            body["payload"] = payload
+        return self._request("POST", f"/api/v1/hives/{hive_id}/events", json=body)
+
+    def reset_event_cursor(self, hive_id: str | None = None) -> None:
+        """Reset the internal event poll cursor.
+
+        Args:
+            hive_id: If provided, reset only the cursor for that hive.
+                If ``None`` (default), reset cursors for all hives.
+
+        After calling this, the next :meth:`poll_events` call will start from
+        the beginning (or from the ``since`` parameter if provided).
+        """
+        if not hasattr(self, "_event_cursors"):
+            self._event_cursors = {}
+            return
+        if hive_id is not None:
+            self._event_cursors.pop(hive_id, None)
+        else:
+            self._event_cursors.clear()
+
+    # ------------------------------------------------------------------
+    # Channels
+    # ------------------------------------------------------------------
+
+    def list_channels(
+        self,
+        hive_id: str,
+        *,
+        status: str | None = None,
+        channel_type: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List channels in a hive with optional filters.
+
+        Args:
+            hive_id: Hive to list channels from.
+            status: Filter by channel status (e.g. ``"open"``, ``"resolved"``).
+            channel_type: Filter by channel type (e.g. ``"discussion"``).
+            page: Page number for pagination.
+            per_page: Results per page (1–100, default 15).
+
+        Returns:
+            List of channel dicts.
+        """
+        params: dict[str, Any] = {}
+        if status is not None:
+            params["status"] = status
+        if channel_type is not None:
+            params["channel_type"] = channel_type
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels",
+            params=params or None,
+        )
+
+    def create_channel(
+        self,
+        hive_id: str,
+        *,
+        title: str,
+        channel_type: str,
+        topic: str | None = None,
+        participants: list[dict[str, Any]] | None = None,
+        resolution_policy: dict[str, Any] | None = None,
+        linked_refs: list[dict[str, Any]] | None = None,
+        on_resolve: dict[str, Any] | None = None,
+        stale_after: int | None = None,
+        initial_message: dict[str, Any] | None = None,
+        auto_invite: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new channel in a hive.
+
+        Args:
+            hive_id: Hive to create the channel in.
+            title: Channel title (max 255 chars).
+            channel_type: Channel type — one of ``"discussion"``, ``"review"``,
+                ``"planning"``, or ``"incident"``.
+            topic: Optional topic description (max 1000 chars).
+            participants: List of participant dicts with ``agent_id`` or
+                ``user_id`` and optional ``role``.
+            resolution_policy: Resolution policy configuration.
+            linked_refs: External references linked to this channel.
+            on_resolve: Actions to perform on resolution (e.g. ``create_tasks``).
+            stale_after: Minutes of inactivity before the channel becomes stale.
+            initial_message: Optional initial message with ``content``,
+                ``message_type``, and ``metadata``.
+            auto_invite: Auto-invite configuration with ``capabilities`` list.
+
+        Returns:
+            The created channel dict with participants and message count.
+        """
+        body: dict[str, Any] = {
+            "title": title,
+            "channel_type": channel_type,
+        }
+        if topic is not None:
+            body["topic"] = topic
+        if participants is not None:
+            body["participants"] = participants
+        if resolution_policy is not None:
+            body["resolution_policy"] = resolution_policy
+        if linked_refs is not None:
+            body["linked_refs"] = linked_refs
+        if on_resolve is not None:
+            body["on_resolve"] = on_resolve
+        if stale_after is not None:
+            body["stale_after"] = stale_after
+        if initial_message is not None:
+            body["initial_message"] = initial_message
+        if auto_invite is not None:
+            body["auto_invite"] = auto_invite
+        return self._request("POST", f"/api/v1/hives/{hive_id}/channels", json=body)
+
+    def get_channel(self, hive_id: str, channel_id: str) -> dict[str, Any]:
+        """Get a single channel with participants and message count.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+
+        Returns:
+            Channel detail dict.
+        """
+        return self._request("GET", f"/api/v1/hives/{hive_id}/channels/{channel_id}")
+
+    def update_channel(
+        self,
+        hive_id: str,
+        channel_id: str,
+        *,
+        title: str | None = None,
+        resolution_policy: dict[str, Any] | None = None,
+        stale_after: int | None = None,
+        on_resolve: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Update a channel's settings.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel to update.
+            title: New title (max 255 chars).
+            resolution_policy: Updated resolution policy.
+            stale_after: Updated stale timeout in minutes.
+            on_resolve: Updated on-resolve actions.
+
+        Returns:
+            Updated channel detail dict.
+        """
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if resolution_policy is not None:
+            body["resolution_policy"] = resolution_policy
+        if stale_after is not None:
+            body["stale_after"] = stale_after
+        if on_resolve is not None:
+            body["on_resolve"] = on_resolve
+        return self._request(
+            "PATCH",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}",
+            json=body,
+        )
+
+    def archive_channel(self, hive_id: str, channel_id: str) -> dict[str, Any]:
+        """Archive a channel (soft delete).
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel to archive.
+
+        Returns:
+            The archived channel dict.
+        """
+        return self._request("DELETE", f"/api/v1/hives/{hive_id}/channels/{channel_id}")
+
+    # ------------------------------------------------------------------
+    # Channel messages
+    # ------------------------------------------------------------------
+
+    def list_channel_messages(
+        self,
+        hive_id: str,
+        channel_id: str,
+        *,
+        since: str | None = None,
+        after_id: str | None = None,
+        page: int | None = None,
+        per_page: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List messages in a channel with optional filters.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            since: ISO-8601 timestamp — return messages created after this time.
+            after_id: Message ID cursor — return messages with ID greater than this.
+            page: Page number for pagination.
+            per_page: Results per page (1–100, default 15).
+
+        Returns:
+            List of message dicts.
+        """
+        params: dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since
+        if after_id is not None:
+            params["after_id"] = after_id
+        if page is not None:
+            params["page"] = page
+        if per_page is not None:
+            params["per_page"] = per_page
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/messages",
+            params=params or None,
+        )
+
+    def post_channel_message(
+        self,
+        hive_id: str,
+        channel_id: str,
+        body: str,
+        *,
+        message_type: str = "discussion",
+        mentions: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Post a new message to a channel.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            body: Message content text.
+            message_type: Type of message — ``"discussion"`` (default),
+                ``"proposal"``, ``"vote"``, ``"decision"``, ``"context"``,
+                ``"system"``, or ``"action"``.
+            mentions: List of agent IDs to mention.
+            metadata: Type-specific metadata (e.g. ``options`` for proposals,
+                ``vote`` and ``proposal_ref`` for votes).
+            reply_to: ID of a message to reply to.
+
+        Returns:
+            The created message dict.
+        """
+        payload: dict[str, Any] = {
+            "content": body,
+            "message_type": message_type,
+        }
+        if mentions is not None:
+            payload["mentions"] = mentions
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if reply_to is not None:
+            payload["reply_to"] = reply_to
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/messages",
+            json=payload,
+        )
+
+    def edit_channel_message(
+        self,
+        hive_id: str,
+        channel_id: str,
+        message_id: str,
+        body: str,
+    ) -> dict[str, Any]:
+        """Edit a channel message (author only, within 5-minute window).
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            message_id: ID of the message to edit.
+            body: New message content.
+
+        Returns:
+            The updated message dict.
+        """
+        return self._request(
+            "PATCH",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/messages/{message_id}",
+            json={"content": body},
+        )
+
+    # ------------------------------------------------------------------
+    # Channel participants
+    # ------------------------------------------------------------------
+
+    def list_channel_participants(
+        self,
+        hive_id: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        """List participants in a channel.
+
+        Fetches the channel detail which includes participants.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+
+        Returns:
+            Channel detail dict containing a ``participants`` list.
+        """
+        return self._request("GET", f"/api/v1/hives/{hive_id}/channels/{channel_id}")
+
+    def add_channel_participant(
+        self,
+        hive_id: str,
+        channel_id: str,
+        participant_type: str,
+        participant_id: str,
+        *,
+        role: str = "contributor",
+        mention_policy: str | None = None,
+    ) -> dict[str, Any]:
+        """Add a participant to a channel.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            participant_type: ``"agent"`` or ``"user"``.
+            participant_id: ID of the agent or user to add.
+            role: Participant role (e.g. ``"contributor"``, ``"reviewer"``,
+                ``"decider"``, ``"initiator"``, ``"observer"``).  Required by
+                the server; defaults to ``"contributor"``.
+            mention_policy: Mention policy (e.g. ``"all"``, ``"mention_only"``).
+
+        Returns:
+            The created participant dict.
+        """
+        body: dict[str, Any] = {
+            "participant_type": participant_type,
+            "participant_id": participant_id,
+            "role": role,
+        }
+        if mention_policy is not None:
+            body["mention_policy"] = mention_policy
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/participants",
+            json=body,
+        )
+
+    def remove_channel_participant(
+        self,
+        hive_id: str,
+        channel_id: str,
+        participant_id: str,
+    ) -> None:
+        """Remove a participant from a channel.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            participant_id: ID of the participant to remove.
+        """
+        self._request(
+            "DELETE",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/participants/{participant_id}",
+        )
+
+    # ------------------------------------------------------------------
+    # Channel voting
+    # ------------------------------------------------------------------
+
+    def vote_on_proposal(
+        self,
+        hive_id: str,
+        channel_id: str,
+        proposal_msg_id: str,
+        vote_value: str,
+        *,
+        body: str | None = None,
+        option_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Vote on a proposal in a channel.
+
+        This is a convenience wrapper around :meth:`post_channel_message`
+        that posts a ``vote`` type message with the correct metadata.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            proposal_msg_id: ID of the proposal message to vote on.
+            vote_value: Vote value — ``"approve"``, ``"reject"``,
+                ``"abstain"``, or ``"block"``.
+            body: Optional vote justification text.
+            option_key: Optional key of the specific proposal option being voted on.
+
+        Returns:
+            The created vote message dict.
+        """
+        metadata: dict[str, Any] = {
+            "vote": vote_value,
+            "proposal_ref": proposal_msg_id,
+        }
+        if option_key is not None:
+            metadata["option_key"] = option_key
+        return self.post_channel_message(
+            hive_id,
+            channel_id,
+            body or f"Vote: {vote_value}",
+            message_type="vote",
+            metadata=metadata,
+        )
+
+    def get_proposal_votes(
+        self,
+        hive_id: str,
+        channel_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Get vote tally for a proposal message.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+            message_id: ID of the proposal message.
+
+        Returns:
+            Vote tally dict with ``proposal_id``, ``total_votes``, ``tally``,
+            ``per_option``, and ``voters``.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/messages/{message_id}/votes",
+        )
+
+    # ------------------------------------------------------------------
+    # Channel summary (TASK-248)
+    # ------------------------------------------------------------------
+
+    def channel_summary(
+        self,
+        hive_id: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        """Get a lightweight summary of the channel for the authenticated agent.
+
+        Returns unread count, mention status, vote status, and the agent's
+        ``last_read_at`` position.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+
+        Returns:
+            Summary dict with ``channel_id``, ``status``, ``unread_count``,
+            ``mentioned``, ``needs_vote``, ``last_message_at``, and
+            ``last_read_at``.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/summary",
+        )
+
+    def mark_channel_read(
+        self,
+        hive_id: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        """Mark a channel as read for the authenticated agent.
+
+        Updates the agent's ``last_read_at`` timestamp to the channel's
+        most recent message time.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+
+        Returns:
+            Dict with ``channel_id`` and updated ``last_read_at``.
+        """
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/read",
+        )
+
+    # ------------------------------------------------------------------
+    # Channel materialization (TASK-207)
+    # ------------------------------------------------------------------
+
+    def materialize_channel(
+        self,
+        hive_id: str,
+        channel_id: str,
+        tasks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Create tasks from a resolved channel's outcome.
+
+        Only allowed on channels with status ``resolved``.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the resolved channel.
+            tasks: List of task template dicts, each with ``type`` (required),
+                and optional ``payload``, ``target_capability``, ``priority``.
+
+        Returns:
+            List of created task dicts.
+        """
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/materialize",
+            json={"tasks": tasks},
+        )
+
+    def list_channel_tasks(
+        self,
+        hive_id: str,
+        channel_id: str,
+    ) -> list[dict[str, Any]]:
+        """List tasks created from a channel.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel.
+
+        Returns:
+            List of task dicts associated with the channel.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/tasks",
+        )
+
+    # ------------------------------------------------------------------
+    # Channel resolution
+    # ------------------------------------------------------------------
+
+    def resolve_channel(
+        self,
+        hive_id: str,
+        channel_id: str,
+        *,
+        outcome: str,
+        materialized_tasks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Manually resolve a channel.
+
+        Only authorized participants (with ``initiator`` or ``decider`` role)
+        can resolve. Only ``open`` or ``deliberating`` channels can be resolved.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel to resolve.
+            outcome: Resolution outcome description (max 2000 chars).
+            materialized_tasks: Optional list of task templates to store
+                with the resolution.  These are **not** created automatically;
+                use :meth:`materialize_channel` or configure
+                ``on_resolve.create_tasks`` to create tasks from them.
+
+        Returns:
+            The resolved channel detail dict.
+        """
+        body: dict[str, Any] = {"outcome": outcome}
+        if materialized_tasks is not None:
+            body["materialized_tasks"] = materialized_tasks
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/resolve",
+            json=body,
+        )
+
+    def reopen_channel(
+        self,
+        hive_id: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        """Reopen a resolved or stale channel.
+
+        Only ``resolved`` or ``stale`` channels can be reopened.
+
+        Args:
+            hive_id: Hive that owns the channel.
+            channel_id: ID of the channel to reopen.
+
+        Returns:
+            The reopened channel detail dict.
+        """
+        return self._request(
+            "POST",
+            f"/api/v1/hives/{hive_id}/channels/{channel_id}/reopen",
+        )
+
+    # ------------------------------------------------------------------
+    # Channel polling
+    # ------------------------------------------------------------------
+
+    def poll_channels(
+        self,
+        hive_id: str,
+    ) -> list[dict[str, Any]]:
+        """Poll channels for activity relevant to the authenticated agent.
+
+        Returns channels with unread messages, pending mentions, or votes needed.
+
+        The response envelope also contains ``meta.next_poll_ms`` — the
+        server-recommended delay before the next poll.  Use
+        :meth:`poll_channels_with_meta` when you need to inspect that field.
+
+        Args:
+            hive_id: Hive to poll channels from.
+
+        Returns:
+            List of channel activity dicts.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/poll",
+        )
+
+    def poll_channels_with_meta(
+        self,
+        hive_id: str,
+    ) -> dict[str, Any]:
+        """Poll channels for activity and return the full envelope.
+
+        Unlike :meth:`poll_channels`, this method returns the full
+        ``{data, meta, errors}`` envelope so callers can inspect
+        ``meta["next_poll_ms"]`` for adaptive polling / backoff.
+
+        Example::
+
+            envelope = client.poll_channels_with_meta(hive_id)
+            channels = envelope["data"]
+            meta = envelope.get("meta", {})
+            next_poll_ms = meta.get("next_poll_ms", 5000)
+
+        Args:
+            hive_id: Hive to poll channels from.
+
+        Returns:
+            The full ``{data, meta, errors}`` envelope where ``data`` is a
+            list of channel activity dicts.
+        """
+        return self._request_envelope(
+            "GET",
+            f"/api/v1/hives/{hive_id}/channels/poll",
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
