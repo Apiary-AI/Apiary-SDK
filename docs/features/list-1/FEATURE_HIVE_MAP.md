@@ -396,7 +396,7 @@ The map is assembled from existing data — no new infrastructure needed.
 | Agent nodes          | `agents` table (status, capabilities)          |
 | Service nodes        | `service_connections` table                    |
 | Inbox nodes          | `inboxes` table                                |
-| Schedule nodes       | `schedules` table                              |
+| Schedule nodes       | `task_schedules` table                         |
 | Agent → service edges| `proxy_log` (aggregate by agent + service)     |
 | Agent → agent edges  | `tasks` (aggregate by source_agent + claimed_by)|
 | Inbox → agent edges  | `tasks` where payload has `_inbox` (aggregate) |
@@ -408,7 +408,7 @@ The map is assembled from existing data — no new infrastructure needed.
 ### 9.1 API Endpoint
 
 ```json
-GET /api/v1/hives/{slug}/topology?timeframe=24h
+GET /api/v1/hives/{hive}/topology?timeframe=24h
 
 {
   "nodes": [

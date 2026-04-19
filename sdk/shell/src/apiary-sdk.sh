@@ -1266,22 +1266,36 @@ apiary_update_rate_limit() {
 
 # apiary_get_persona_version — lightweight version check for hot-reload polling.
 #   [-k KNOWN_VERSION]  (optional) — if set, response includes a 'changed' bool
+#   [-p KNOWN_PLATFORM_VERSION]  (optional) — if set, platform context changes
+#       are also factored into the 'changed' flag
 #
 # Returns the server-assigned persona version for this agent without fetching full
 # documents. When -k KNOWN_VERSION is provided, the response also includes
 # 'changed' (true/false) comparing the server version to the provided value.
+# When -p KNOWN_PLATFORM_VERSION is also provided, platform context version
+# changes will additionally trigger 'changed'.
 apiary_get_persona_version() {
-    local known_version="" query_string=""
+    local known_version="" known_platform_version="" query_string=""
     local OPTIND OPTARG opt
-    while getopts "k:" opt; do
+    while getopts "k:p:" opt; do
         case "$opt" in
             k) known_version="$OPTARG" ;;
+            p) known_platform_version="$OPTARG" ;;
             *) _apiary_err "get_persona_version: unknown option -$opt"; return $APIARY_ERR ;;
         esac
     done
 
+    local params=()
     if [[ -n "$known_version" ]]; then
-        query_string="?known_version=${known_version}"
+        params+=("known_version=${known_version}")
+    fi
+    if [[ -n "$known_platform_version" ]]; then
+        params+=("known_platform_version=${known_platform_version}")
+    fi
+
+    if [[ ${#params[@]} -gt 0 ]]; then
+        local IFS='&'
+        query_string="?${params[*]}"
     fi
 
     _apiary_request GET "/api/v1/persona/version${query_string}"
@@ -1289,16 +1303,20 @@ apiary_get_persona_version() {
 
 # apiary_check_persona_version — returns 0 (true) if persona version has changed.
 #   -k KNOWN_VERSION  (required) — the version the agent currently holds locally
+#   [-p KNOWN_PLATFORM_VERSION]  (optional) — the platform context version the
+#       agent currently holds locally. When provided, platform context changes
+#       will also trigger a refresh.
 #
 # Returns exit code 0 if the server persona version differs from KNOWN_VERSION
 # (i.e., the agent should refresh its persona), or 1 if unchanged.
 # Exits with APIARY_ERR on request failure.
 apiary_check_persona_version() {
-    local known_version=""
+    local known_version="" known_platform_version=""
     local OPTIND OPTARG opt
-    while getopts "k:" opt; do
+    while getopts "k:p:" opt; do
         case "$opt" in
             k) known_version="$OPTARG" ;;
+            p) known_platform_version="$OPTARG" ;;
             *) _apiary_err "check_persona_version: unknown option -$opt"; return $APIARY_ERR ;;
         esac
     done
@@ -1313,8 +1331,13 @@ apiary_check_persona_version() {
         return $APIARY_ERR_DEPS
     fi
 
+    local version_args=(-k "$known_version")
+    if [[ -n "$known_platform_version" ]]; then
+        version_args+=(-p "$known_platform_version")
+    fi
+
     local result
-    result=$(apiary_get_persona_version -k "$known_version") || return $?
+    result=$(apiary_get_persona_version "${version_args[@]}") || return $?
 
     local changed
     changed=$(echo "$result" | jq -r '.changed // "false"')
@@ -1666,4 +1689,257 @@ apiary_discover_services() {
     local qs="?$(IFS='&'; echo "${params[*]}")"
 
     _apiary_request GET "/api/v1/hives/${hive_id}/agents${qs}"
+}
+
+# ── Workflows ──────────────────────────────────────────────────────
+
+# apiary_list_workflows — list workflows in a hive.
+#   HIVE_ID  [-p PAGE] [-l PER_PAGE] [-a IS_ACTIVE] [-q SEARCH]
+apiary_list_workflows() {
+    local hive_id="${1:?usage: apiary_list_workflows HIVE_ID}"
+    shift
+    local page="" per_page="" is_active="" search=""
+    local OPTIND OPTARG opt
+    while getopts "p:l:a:q:" opt; do
+        case "$opt" in
+            p) page="$OPTARG" ;;
+            l) per_page="$OPTARG" ;;
+            a) is_active="$OPTARG" ;;
+            q) search="$OPTARG" ;;
+            *) _apiary_err "list_workflows: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local params=()
+    [[ -n "$page" ]]      && params+=("page=$(_apiary_urlencode "$page")")
+    [[ -n "$per_page" ]]  && params+=("per_page=$(_apiary_urlencode "$per_page")")
+    [[ -n "$is_active" ]] && params+=("is_active=$(_apiary_urlencode "$is_active")")
+    [[ -n "$search" ]]    && params+=("search=$(_apiary_urlencode "$search")")
+    local qs=""
+    if [[ ${#params[@]} -gt 0 ]]; then
+        qs="?$(IFS='&'; echo "${params[*]}")"
+    fi
+
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows${qs}"
+}
+
+# apiary_get_workflow — get a single workflow.
+#   HIVE_ID  WORKFLOW_ID
+apiary_get_workflow() {
+    local hive_id="${1:?usage: apiary_get_workflow HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_get_workflow HIVE_ID WORKFLOW_ID}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}"
+}
+
+# apiary_create_workflow — create a workflow.
+#   HIVE_ID  -S SLUG  -n NAME  -s STEPS_JSON  [-c TRIGGER_CONFIG_JSON] [-d DESCRIPTION] [-a IS_ACTIVE] [-e SETTINGS_JSON]
+apiary_create_workflow() {
+    local hive_id="${1:?usage: apiary_create_workflow HIVE_ID -S SLUG -n NAME -s STEPS_JSON}"
+    shift
+    local slug="" name="" steps="" trigger_config="" description="" is_active="" settings=""
+    local OPTIND OPTARG opt
+    while getopts "S:n:s:c:d:a:e:" opt; do
+        case "$opt" in
+            S) slug="$OPTARG" ;;
+            n) name="$OPTARG" ;;
+            s) steps="$OPTARG" ;;
+            c) trigger_config="$OPTARG" ;;
+            d) description="$OPTARG" ;;
+            a) is_active="$OPTARG" ;;
+            e) settings="$OPTARG" ;;
+            *) _apiary_err "create_workflow: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    if [[ -z "$slug" || -z "$name" || -z "$steps" ]]; then
+        _apiary_err "create_workflow: -S SLUG, -n NAME and -s STEPS_JSON are required"
+        return $APIARY_ERR
+    fi
+
+    local body
+    body=$(_apiary_build_json \
+        "slug" "$slug" \
+        "name" "$name" \
+        "steps" "$steps" \
+        "trigger_config" "$trigger_config" \
+        "description" "$description" \
+        "is_active" "$is_active" \
+        "settings" "$settings"
+    ) || return $APIARY_ERR
+
+    _apiary_request POST "/api/v1/hives/${hive_id}/workflows" "$body"
+}
+
+# apiary_update_workflow — update a workflow (partial update).
+#   HIVE_ID  WORKFLOW_ID  [-S SLUG] [-n NAME] [-s STEPS_JSON] [-c TRIGGER_CONFIG_JSON] [-d DESCRIPTION] [-a IS_ACTIVE] [-e SETTINGS_JSON]
+apiary_update_workflow() {
+    local hive_id="${1:?usage: apiary_update_workflow HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_update_workflow HIVE_ID WORKFLOW_ID}"
+    shift 2
+    local slug="" name="" steps="" trigger_config="" description="" is_active="" settings=""
+    local OPTIND OPTARG opt
+    while getopts "S:n:s:c:d:a:e:" opt; do
+        case "$opt" in
+            S) slug="$OPTARG" ;;
+            n) name="$OPTARG" ;;
+            s) steps="$OPTARG" ;;
+            c) trigger_config="$OPTARG" ;;
+            d) description="$OPTARG" ;;
+            a) is_active="$OPTARG" ;;
+            e) settings="$OPTARG" ;;
+            *) _apiary_err "update_workflow: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local body
+    body=$(_apiary_build_json \
+        "slug" "$slug" \
+        "name" "$name" \
+        "steps" "$steps" \
+        "trigger_config" "$trigger_config" \
+        "description" "$description" \
+        "is_active" "$is_active" \
+        "settings" "$settings"
+    ) || return $APIARY_ERR
+
+    _apiary_request PUT "/api/v1/hives/${hive_id}/workflows/${workflow_id}" "$body"
+}
+
+# apiary_delete_workflow — delete a workflow.
+#   HIVE_ID  WORKFLOW_ID
+apiary_delete_workflow() {
+    local hive_id="${1:?usage: apiary_delete_workflow HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_delete_workflow HIVE_ID WORKFLOW_ID}"
+    _apiary_request DELETE "/api/v1/hives/${hive_id}/workflows/${workflow_id}"
+}
+
+# apiary_run_workflow — start a workflow run.
+#   HIVE_ID  WORKFLOW_ID  [-d PAYLOAD_JSON]
+apiary_run_workflow() {
+    local hive_id="${1:?usage: apiary_run_workflow HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_run_workflow HIVE_ID WORKFLOW_ID}"
+    shift 2
+    local payload=""
+    local OPTIND OPTARG opt
+    while getopts "d:" opt; do
+        case "$opt" in
+            d) payload="$OPTARG" ;;
+            *) _apiary_err "run_workflow: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local body
+    body=$(_apiary_build_json "payload" "$payload") || return $APIARY_ERR
+    _apiary_request POST "/api/v1/hives/${hive_id}/workflows/${workflow_id}/runs" "$body"
+}
+
+# apiary_list_workflow_runs — list runs for a workflow.
+#   HIVE_ID  WORKFLOW_ID  [-p PAGE] [-l PER_PAGE] [-s STATUS]
+apiary_list_workflow_runs() {
+    local hive_id="${1:?usage: apiary_list_workflow_runs HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_list_workflow_runs HIVE_ID WORKFLOW_ID}"
+    shift 2
+    local page="" per_page="" status=""
+    local OPTIND OPTARG opt
+    while getopts "p:l:s:" opt; do
+        case "$opt" in
+            p) page="$OPTARG" ;;
+            l) per_page="$OPTARG" ;;
+            s) status="$OPTARG" ;;
+            *) _apiary_err "list_workflow_runs: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local params=()
+    [[ -n "$page" ]]     && params+=("page=$(_apiary_urlencode "$page")")
+    [[ -n "$per_page" ]] && params+=("per_page=$(_apiary_urlencode "$per_page")")
+    [[ -n "$status" ]]   && params+=("status=$(_apiary_urlencode "$status")")
+    local qs=""
+    if [[ ${#params[@]} -gt 0 ]]; then
+        qs="?$(IFS='&'; echo "${params[*]}")"
+    fi
+
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}/runs${qs}"
+}
+
+# apiary_get_workflow_run — get a single workflow run.
+#   HIVE_ID  WORKFLOW_ID  RUN_ID
+apiary_get_workflow_run() {
+    local hive_id="${1:?usage: apiary_get_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local workflow_id="${2:?usage: apiary_get_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local run_id="${3:?usage: apiary_get_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}/runs/${run_id}"
+}
+
+# apiary_cancel_workflow_run — cancel a running workflow run.
+#   HIVE_ID  WORKFLOW_ID  RUN_ID
+apiary_cancel_workflow_run() {
+    local hive_id="${1:?usage: apiary_cancel_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local workflow_id="${2:?usage: apiary_cancel_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local run_id="${3:?usage: apiary_cancel_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    _apiary_request POST "/api/v1/hives/${hive_id}/workflows/${workflow_id}/runs/${run_id}/cancel"
+}
+
+# apiary_retry_workflow_run — retry a failed workflow run.
+#   HIVE_ID  WORKFLOW_ID  RUN_ID
+apiary_retry_workflow_run() {
+    local hive_id="${1:?usage: apiary_retry_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local workflow_id="${2:?usage: apiary_retry_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    local run_id="${3:?usage: apiary_retry_workflow_run HIVE_ID WORKFLOW_ID RUN_ID}"
+    _apiary_request POST "/api/v1/hives/${hive_id}/workflows/${workflow_id}/runs/${run_id}/retry"
+}
+
+# apiary_list_workflow_versions — list versions of a workflow.
+#   HIVE_ID  WORKFLOW_ID  [-p PAGE] [-l PER_PAGE]
+apiary_list_workflow_versions() {
+    local hive_id="${1:?usage: apiary_list_workflow_versions HIVE_ID WORKFLOW_ID}"
+    local workflow_id="${2:?usage: apiary_list_workflow_versions HIVE_ID WORKFLOW_ID}"
+    shift 2
+    local page="" per_page=""
+    local OPTIND OPTARG opt
+    while getopts "p:l:" opt; do
+        case "$opt" in
+            p) page="$OPTARG" ;;
+            l) per_page="$OPTARG" ;;
+            *) _apiary_err "list_workflow_versions: unknown option -$opt"; return $APIARY_ERR ;;
+        esac
+    done
+
+    local params=()
+    [[ -n "$page" ]]     && params+=("page=$(_apiary_urlencode "$page")")
+    [[ -n "$per_page" ]] && params+=("per_page=$(_apiary_urlencode "$per_page")")
+    local qs=""
+    if [[ ${#params[@]} -gt 0 ]]; then
+        qs="?$(IFS='&'; echo "${params[*]}")"
+    fi
+
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}/versions${qs}"
+}
+
+# apiary_get_workflow_version — get a specific workflow version.
+#   HIVE_ID  WORKFLOW_ID  VERSION
+apiary_get_workflow_version() {
+    local hive_id="${1:?usage: apiary_get_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    local workflow_id="${2:?usage: apiary_get_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    local version="${3:?usage: apiary_get_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}/versions/${version}"
+}
+
+# apiary_diff_workflow_versions — diff two workflow versions.
+#   HIVE_ID  WORKFLOW_ID  FROM_VERSION  TO_VERSION
+apiary_diff_workflow_versions() {
+    local hive_id="${1:?usage: apiary_diff_workflow_versions HIVE_ID WORKFLOW_ID FROM TO}"
+    local workflow_id="${2:?usage: apiary_diff_workflow_versions HIVE_ID WORKFLOW_ID FROM TO}"
+    local from_version="${3:?usage: apiary_diff_workflow_versions HIVE_ID WORKFLOW_ID FROM TO}"
+    local to_version="${4:?usage: apiary_diff_workflow_versions HIVE_ID WORKFLOW_ID FROM TO}"
+    _apiary_request GET "/api/v1/hives/${hive_id}/workflows/${workflow_id}/versions/${from_version}/diff/${to_version}"
+}
+
+# apiary_rollback_workflow_version — rollback a workflow to a specific version.
+#   HIVE_ID  WORKFLOW_ID  VERSION
+apiary_rollback_workflow_version() {
+    local hive_id="${1:?usage: apiary_rollback_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    local workflow_id="${2:?usage: apiary_rollback_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    local version="${3:?usage: apiary_rollback_workflow_version HIVE_ID WORKFLOW_ID VERSION}"
+    _apiary_request POST "/api/v1/hives/${hive_id}/workflows/${workflow_id}/versions/${version}/rollback"
 }

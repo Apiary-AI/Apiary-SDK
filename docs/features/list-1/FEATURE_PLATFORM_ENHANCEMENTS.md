@@ -18,27 +18,22 @@ No user-facing model for recurring work.
 
 #### Design
 
-A **Schedule** is a rule that creates tasks on a cron or interval basis.
+A **TaskSchedule** is a rule that creates tasks on a cron or interval basis.
 
 ```json
-POST /api/v1/schedules
+POST /api/v1/hives/{hive}/schedules
 {
   "name": "Nightly code scan",
-  "task_template": {
-    "type": "code_scan",
-    "target_capability": "scanner",
-    "payload": { "scope": "full", "branch": "main" },
-    "failure_policy": {
-      "max_retries": 2,
-      "guarantee": "at_least_once"
-    }
-  },
-  "trigger": {
-    "type": "cron",
-    "expression": "0 3 * * *",
-    "timezone": "Europe/Kyiv"
-  },
-  "enabled": true
+  "trigger_type": "cron",
+  "cron_expression": "0 3 * * *",
+  "timezone": "Europe/Kyiv",
+  "task_type": "code_scan",
+  "task_target_capability": "scanner",
+  "task_payload": { "scope": "full", "branch": "main" },
+  "task_failure_policy": {
+    "max_retries": 2,
+    "guarantee": "at_least_once"
+  }
 }
 ```
 
@@ -46,9 +41,9 @@ Trigger types:
 
 | Type       | Config                          | Example                     |
 |------------|----------------------------------|-----------------------------|
-| `cron`     | Cron expression + timezone       | `0 3 * * *` (daily 3 AM)   |
-| `interval` | Every N seconds/minutes/hours    | `every: 300` (every 5 min) |
-| `once`     | Specific datetime                | `at: 2025-03-01T09:00:00Z` |
+| `cron`     | `cron_expression` + `timezone`   | `0 3 * * *` (daily 3 AM)   |
+| `interval` | `interval_seconds`               | `300` (every 5 min)        |
+| `once`     | `run_at` timestamp               | `2025-03-01T09:00:00Z`     |
 
 #### Execution
 
@@ -60,10 +55,10 @@ Schedule::command('apiary:dispatch-schedules')->everyTenSeconds();
 ```
 
 The job:
-1. Query schedules where `next_run_at <= now()` and `enabled = true`
-2. Create task from `task_template`
+1. Query task_schedules where `next_run_at <= now()` and `status = 'active'`
+2. Create task from template columns (`task_type`, `task_payload`, etc.)
 3. Update `next_run_at` based on trigger
-4. Log to `schedule_log`
+4. Track dispatched tasks via `tasks.schedule_id` FK (no separate schedule_log table)
 
 #### Overlap Protection
 
@@ -79,67 +74,83 @@ What if previous run is still in progress?
 }
 ```
 
-| Policy   | Behavior                                          |
-|----------|---------------------------------------------------|
-| `skip`   | Don't create new task if previous still running   |
-| `allow`  | Create anyway (parallel runs OK)                  |
-| `cancel` | Cancel previous task, create new one              |
+| Policy             | Behavior                                          |
+|--------------------|---------------------------------------------------|
+| `skip`             | Don't create new task if previous still running   |
+| `allow`            | Create anyway (parallel runs OK)                  |
+| `cancel_previous`  | Cancel previous task, create new one              |
 
-"Previous run still running" means: the schedule's `last_task_id` references a task with status `pending` or `in_progress`. The `cancel` policy calls the task cancellation endpoint on the previous task, then creates the new task. If cancellation times out (e.g., the previous task is already completing), both tasks may run briefly — this is an acceptable edge case since the new task will proceed regardless.
+"Previous run still running" means: the schedule's `last_task_id` references a task with status `pending` or `in_progress`. The `cancel_previous` policy calls the task cancellation endpoint on the previous task, then creates the new task. If cancellation times out (e.g., the previous task is already completing), both tasks may run briefly — this is an acceptable edge case since the new task will proceed regardless.
 
 #### Schema
 
 ```sql
-CREATE TABLE schedules (
-    id              VARCHAR(26) PRIMARY KEY,
-    apiary_id       VARCHAR(26) NOT NULL,
-    hive_id         VARCHAR(26) NOT NULL REFERENCES hives(id),
-    name            VARCHAR(255) NOT NULL,
-    description     TEXT,
-    
-    task_template   JSONB NOT NULL,
-    trigger_type    VARCHAR(20) NOT NULL,       -- cron, interval, once
-    trigger_config  JSONB NOT NULL,             -- { expression, timezone } or { every } or { at }
-    overlap_policy  VARCHAR(20) DEFAULT 'skip',
-    
-    enabled         BOOLEAN DEFAULT TRUE,
-    next_run_at     TIMESTAMP,
-    last_run_at     TIMESTAMP,
-    last_task_id    VARCHAR(26) REFERENCES tasks(id),
-    run_count       INTEGER DEFAULT 0,
-    
-    created_by      VARCHAR(26),               -- agent or user
-    created_at      TIMESTAMP DEFAULT NOW(),
-    updated_at      TIMESTAMP DEFAULT NOW()
+CREATE TABLE task_schedules (
+    id                      VARCHAR(26) PRIMARY KEY,
+    apiary_id               VARCHAR(26) NOT NULL REFERENCES apiaries(id),
+    hive_id                 VARCHAR(26) NOT NULL REFERENCES hives(id),
+    name                    VARCHAR(150) NOT NULL,
+    description             VARCHAR(500),
+
+    -- Trigger configuration (separate columns, not a single JSONB)
+    trigger_type            VARCHAR(20) NOT NULL,          -- cron, interval, once
+    cron_expression         VARCHAR(100),                  -- for type=cron
+    timezone                VARCHAR(100),                  -- IANA timezone for cron evaluation
+    interval_seconds        UNSIGNED INT,                  -- for type=interval
+    run_at                  TIMESTAMP,                     -- for type=once
+
+    -- Task template (columns copied into each dispatched task)
+    task_type               VARCHAR(100) NOT NULL,
+    task_payload            JSONB DEFAULT '{}',
+    task_priority           SMALLINT DEFAULT 2,
+    task_target_agent_id    VARCHAR(26) REFERENCES agents(id),
+    task_target_capability  VARCHAR(100),
+    task_timeout_seconds    INT DEFAULT 1800,
+    task_max_retries        SMALLINT DEFAULT 3,
+    task_context_refs       JSONB DEFAULT '[]',
+    task_failure_policy     JSONB,
+
+    -- Overlap policy: skip | allow | cancel_previous
+    overlap_policy          VARCHAR(20) DEFAULT 'skip',
+
+    -- State
+    status                  VARCHAR(20) DEFAULT 'active',  -- active | paused | expired
+    created_by              VARCHAR(26) REFERENCES agents(id),
+    next_run_at             TIMESTAMP,
+    last_run_at             TIMESTAMP,
+    last_task_id            VARCHAR(26) REFERENCES tasks(id),
+    run_count               UNSIGNED INT DEFAULT 0,
+    expires_at              TIMESTAMP,
+
+    created_at              TIMESTAMP DEFAULT NOW(),
+    updated_at              TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_schedules_due ON schedules (next_run_at)
-    WHERE enabled = TRUE;
-
-CREATE TABLE schedule_log (
-    id              BIGSERIAL PRIMARY KEY,
-    schedule_id     VARCHAR(26) NOT NULL REFERENCES schedules(id),
-    task_id         VARCHAR(26) REFERENCES tasks(id),
-    status          VARCHAR(20) NOT NULL,       -- dispatched, skipped_overlap, error
-    details         JSONB DEFAULT '{}',
-    created_at      TIMESTAMP DEFAULT NOW()
-);
+CREATE INDEX idx_task_schedules_due ON task_schedules (next_run_at)
+    WHERE status = 'active' AND next_run_at IS NOT NULL;
+CREATE INDEX idx_task_schedules_hive ON task_schedules (hive_id, status);
 ```
+
+> **Design note:** There is no separate `schedule_log` table. Dispatched tasks
+> are tracked via the `tasks.schedule_id` FK that references the originating
+> `task_schedules` row. Query task history for a schedule with
+> `SELECT * FROM tasks WHERE schedule_id = :id ORDER BY created_at DESC`.
 
 #### API
 
 ```
-POST   /api/v1/schedules              — Create schedule
-GET    /api/v1/schedules              — List schedules in hive
-GET    /api/v1/schedules/{id}         — Get schedule + recent log
-PATCH  /api/v1/schedules/{id}         — Update
-DELETE /api/v1/schedules/{id}         — Delete
-POST   /api/v1/schedules/{id}/trigger — Manual trigger now
-POST   /api/v1/schedules/{id}/pause   — Pause
-POST   /api/v1/schedules/{id}/resume  — Resume
+POST   /api/v1/hives/{hive}/schedules              — Create schedule
+GET    /api/v1/hives/{hive}/schedules              — List schedules in hive
+GET    /api/v1/hives/{hive}/schedules/{id}         — Get schedule details
+PUT    /api/v1/hives/{hive}/schedules/{id}         — Update (partial update)
+DELETE /api/v1/hives/{hive}/schedules/{id}         — Delete
+PATCH  /api/v1/hives/{hive}/schedules/{id}/pause   — Pause schedule
+PATCH  /api/v1/hives/{hive}/schedules/{id}/resume  — Resume schedule
 ```
 
-Permission: `manage:schedules` (agents) or Member+ role (dashboard).
+> **Not yet implemented:** Manual trigger endpoint (`POST .../schedules/{id}/trigger`).
+
+Permission: `schedules.read` / `schedules.write` (agents) or Member+ role (dashboard).
 
 #### Dashboard
 
@@ -160,9 +171,11 @@ agent process killed → progress_timeout → task retried. Wasteful and noisy.
 
 Agent signals it's shutting down. System stops giving it new tasks. Agent finishes current work, then exits cleanly.
 
+Draining is implemented as a **boolean flag** (`is_draining`) separate from the agent's status field. Agent statuses remain: `online`, `busy`, `idle`, `offline`, `error`. Any online/busy/idle agent can additionally have `is_draining = true`.
+
 ```
 Agent lifecycle:
-  online → active → draining → offline
+  online/busy/idle  → is_draining=true (no new anycast work) → offline
 ```
 
 #### Protocol
@@ -173,7 +186,7 @@ Agent lifecycle:
 POST /api/v1/agents/drain
 {
   "reason": "Upgrading to v2.1",
-  "max_drain_seconds": 120
+  "deadline_minutes": 2
 }
 ```
 
@@ -181,20 +194,30 @@ Response:
 
 ```json
 {
-  "status": "draining",
+  "is_draining": true,
   "active_tasks": ["tsk_abc", "tsk_def"],
-  "drain_deadline": "2025-02-20T12:02:00Z"
+  "drain_deadline_at": "2025-02-20T12:02:00Z"
 }
 ```
 
 **What happens:**
-1. Agent status → `draining`
-2. Poll endpoint returns empty tasks for this agent (no new work)
+1. Agent flag `is_draining` → `true`, `drain_started_at` recorded
+2. Poll endpoint returns empty tasks for this agent (no new anycast work)
 3. Agent finishes current tasks normally (complete/fail)
-4. When all active tasks done → agent calls `DELETE /agents/{id}` or just disconnects
-5. If `drain_deadline` reached and tasks still active → system reassigns them
+4. When all active tasks done → agent calls `POST /api/v1/agents/logout` or just disconnects
+5. If `drain_deadline_at` reached and tasks still active → system reassigns them
+
+**To cancel a drain:** `POST /api/v1/agents/undrain` clears the drain flag and returns the agent to normal operation.
 
 **Dashboard shows:** "Agent code-reviewer-1 is draining (2 tasks remaining, deadline in 90s)"
+
+**API endpoints:**
+```
+POST /api/v1/agents/drain    — Enter drain mode (agent-authenticated)
+POST /api/v1/agents/undrain  — Cancel drain mode (agent-authenticated)
+GET  /api/v1/agents/drain    — Get drain status (agent-authenticated)
+POST /api/v1/agents/logout   — Deregister / go offline
+```
 
 #### SDK Support
 
@@ -203,9 +226,9 @@ Response:
 import signal
 
 def handle_shutdown(signum, frame):
-    client.drain(reason="SIGTERM received", max_drain_seconds=120)
+    client.drain(reason="SIGTERM received", deadline_minutes=2)
     # Finish current work...
-    client.deregister()
+    client.logout()
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, handle_shutdown)
@@ -217,28 +240,31 @@ Docker sends SIGTERM before SIGKILL. Agent catches it, drains, exits.
 #### Schema Change
 
 ```sql
--- agents.status gains 'draining' value
--- Existing values: online, offline, busy
--- New value: draining
+-- Draining is a boolean flag, NOT a status enum value.
+-- Agent statuses remain: online, busy, idle, offline, error.
 
-ALTER TABLE agents ADD COLUMN drain_deadline TIMESTAMP;
-ALTER TABLE agents ADD COLUMN drain_reason TEXT;
+ALTER TABLE agents ADD COLUMN is_draining        BOOLEAN DEFAULT FALSE;
+ALTER TABLE agents ADD COLUMN drain_started_at    TIMESTAMP;
+ALTER TABLE agents ADD COLUMN drain_deadline_at   TIMESTAMP;
+ALTER TABLE agents ADD COLUMN drain_reason        VARCHAR(500);
+
+CREATE INDEX agents_hive_draining_idx ON agents (hive_id, is_draining);
 ```
 
 #### Poll Query Update
 
 ```sql
--- Exclude draining agents from task assignment
+-- Exclude draining agents from anycast task assignment
 SELECT * FROM tasks
 WHERE ...
   AND (target_agent_id = :agent_id OR (
     target_agent_id IS NULL
-    AND :agent_status != 'draining'
+    AND :agent_is_draining = FALSE
   ))
 ...
 ```
 
-Draining agents still receive tasks explicitly assigned to them (`target_agent_id`) via poll — they do NOT pick up anycast tasks (capability-matched tasks with no `target_agent_id`). After `drain_deadline` passes, even explicitly assigned tasks are reassigned to other capable agents.
+Draining agents still receive tasks explicitly assigned to them (`target_agent_id`) via poll — they do NOT pick up anycast tasks (capability-matched tasks with no `target_agent_id`). After `drain_deadline_at` passes, even explicitly assigned tasks are reassigned to other capable agents.
 
 ---
 
@@ -258,7 +284,7 @@ Knowledge Store uses JSONB. Works for structured data. Breaks for:
 **Attachments** — files stored in object storage (local disk for CE, S3 for Cloud), referenced from tasks and knowledge entries.
 
 ```json
-POST /api/v1/attachments
+POST /api/v1/hives/{hive}/attachments
 Content-Type: multipart/form-data
 
 file: <binary>
@@ -277,7 +303,7 @@ Response:
   "filename": "pr-42-diff.patch",
   "size_bytes": 245000,
   "content_type": "text/x-patch",
-  "download_url": "/api/v1/attachments/att_xyz789/download",
+  "download_url": "/api/v1/hives/{hive}/attachments/att_xyz789/download",
   "expires_at": null
 }
 ```
@@ -314,10 +340,12 @@ POST /api/v1/knowledge
 ```php
 // config/apiary.php
 'attachments' => [
-    'disk' => env('APIARY_ATTACHMENT_DISK', 'local'),  // 'local' or 's3'
-    'max_size' => env('APIARY_ATTACHMENT_MAX_SIZE', 10485760),  // 10MB
-    'allowed_types' => ['*'],  // or restrict: ['text/*', 'image/*', 'application/pdf']
-    'retention_days' => env('APIARY_ATTACHMENT_RETENTION', null),  // null = forever
+    'disk' => env('APIARY_ATTACHMENT_DISK', 'local'),            // 'local' or 's3'
+    'max_size' => (int) env('APIARY_ATTACHMENT_MAX_SIZE', 10485760),  // 10 MB
+    'retention_days' => env('APIARY_ATTACHMENT_RETENTION', null), // null = forever
+    'presigned_url_ttl' => (int) env('APIARY_ATTACHMENT_URL_TTL', 60), // minutes
+    'path_prefix' => env('APIARY_ATTACHMENT_PATH_PREFIX', 'attachments'),
+    'quota_bytes' => env('APIARY_ATTACHMENT_QUOTA_BYTES', null),  // null = unlimited
 ],
 ```
 
@@ -353,11 +381,11 @@ CREATE INDEX idx_attachments_expires ON attachments (expires_at) WHERE expires_a
 #### API
 
 ```
-POST   /api/v1/attachments              — Upload file
-GET    /api/v1/attachments/{id}         — Get metadata
-GET    /api/v1/attachments/{id}/download — Download file (or redirect to pre-signed URL)
-DELETE /api/v1/attachments/{id}         — Delete
-GET    /api/v1/tasks/{id}/attachments   — List attachments for a task
+POST   /api/v1/hives/{hive}/attachments              — Upload file
+GET    /api/v1/hives/{hive}/attachments               — List attachments
+GET    /api/v1/hives/{hive}/attachments/{id}          — Get metadata
+GET    /api/v1/hives/{hive}/attachments/{id}/download — Download file (or redirect to pre-signed URL)
+DELETE /api/v1/hives/{hive}/attachments/{id}          — Delete
 ```
 
 #### Quota
@@ -395,7 +423,8 @@ No configuration needed. No new tables. Pure derived concept.
 #### Pool Health Metrics
 
 ```json
-GET /api/v1/pools
+GET /api/v1/hives/{hive}/pools
+-- Also: GET /api/v1/hives/{hive}/pool/health
 
 {
   "pools": [
@@ -453,7 +482,7 @@ idle:        online_agents == 0 AND pending == 0
 **Edge cases:**
 - If `online_agents = 0` and `pending > 0` → status is `critical` (work waiting, nobody to do it).
 - If `online_agents = 0` and `pending = 0` → status is `idle` (pool exists but dormant).
-- Draining agents count as online for health calculation until their `drain_deadline` passes.
+- Draining agents count as online for health calculation until their `drain_deadline_at` passes.
 
 #### Dashboard: Pool View
 
@@ -489,10 +518,10 @@ Dashboard is great for humans. Ops teams need machine-readable metrics for alert
 
 #### Design
 
-**Prometheus endpoint:**
+**Prometheus endpoint** (requires `metrics:read` permission):
 
 ```
-GET /metrics
+GET /api/v1/metrics
 
 # HELP apiary_tasks_total Total tasks created
 # TYPE apiary_tasks_total counter
@@ -521,12 +550,20 @@ apiary_proxy_requests_total{service="github",status="200"} 5420
 apiary_dead_letter_count{hive="backend"} 0
 ```
 
-**System event webhooks:**
+**Notification endpoints:**
 
-Apiary can POST notifications to external URLs on system events:
+Apiary can POST notifications to external URLs on system events. This is implemented via the `notification_endpoints` table and corresponding API:
+
+```
+GET    /api/v1/notification-endpoints          — List endpoints
+POST   /api/v1/notification-endpoints          — Create endpoint
+GET    /api/v1/notification-endpoints/{id}     — Get endpoint
+PATCH  /api/v1/notification-endpoints/{endpoint} — Update endpoint
+DELETE /api/v1/notification-endpoints/{id}     — Delete endpoint
+```
 
 ```json
-POST /api/v1/config/system-hooks
+POST /api/v1/notification-endpoints
 {
   "url": "https://hooks.slack.com/services/xxx",
   "events": [
@@ -542,10 +579,12 @@ POST /api/v1/config/system-hooks
 
 Supported formats: `json` (raw), `slack` (Slack block kit), `discord`, `pagerduty`.
 
+Permission: `manage:notification_endpoints`.
+
 #### Implementation
 
 Laravel package `spatie/laravel-prometheus` or lightweight custom exporter.
-System hooks: reuse existing event bus — listen for system events, POST to registered hooks.
+Notification endpoints: reuse existing event bus — listen for system events, POST to registered endpoints. Delivery results are logged in the `notification_delivery_log` table.
 
 ---
 
@@ -562,8 +601,10 @@ Current: `context_refs` links to Knowledge Store entries. But there's no concept
 
 A **Thread** is a chain of related tasks sharing accumulated context.
 
+Task creation accepts `thread_id` and `context_message` fields:
+
 ```json
-POST /api/v1/tasks
+POST /api/v1/hives/{hive}/tasks
 {
   "type": "refactor",
   "target_capability": "refactoring",
@@ -633,6 +674,21 @@ Tasks table addition:
 ALTER TABLE tasks ADD COLUMN thread_id VARCHAR(26) REFERENCES threads(id);
 ```
 
+#### API
+
+Thread endpoints are hive-scoped:
+
+```
+GET    /api/v1/hives/{hive}/threads               — List threads
+POST   /api/v1/hives/{hive}/threads               — Create thread
+GET    /api/v1/hives/{hive}/threads/{id}           — Get thread + messages
+DELETE /api/v1/hives/{hive}/threads/{id}           — Delete thread
+POST   /api/v1/hives/{hive}/threads/{id}/messages  — Append message
+DELETE /api/v1/hives/{hive}/threads/{id}/messages  — Clear messages
+```
+
+Permission: `threads.read` / `threads.write`.
+
 ---
 
 ### 7. Task Contracts (Schema Validation)
@@ -644,73 +700,56 @@ Silent failure — agent gets wrong data shape and produces garbage.
 
 #### Design
 
-**Task Types** can have optional JSON Schema contracts:
+Task types can have optional JSON Schema contracts. Rather than a separate `task_types` table, contracts are stored in the **`hives.task_contracts` JSONB column** — a map keyed by task type:
 
 ```json
-POST /api/v1/config/task-types
+// hives.task_contracts JSONB
 {
-  "type": "code_review",
-  "description": "Review a pull request",
-  "payload_schema": {
-    "type": "object",
-    "required": ["repo", "pr_number"],
-    "properties": {
-      "repo": { "type": "string", "description": "Full repo name (org/repo)" },
-      "pr_number": { "type": "integer" },
-      "focus_areas": {
-        "type": "array",
-        "items": { "type": "string" },
-        "description": "Optional areas to focus review on"
+  "code_review": {
+    "description": "Review a pull request",
+    "payload_schema": {
+      "type": "object",
+      "required": ["repo", "pr_number"],
+      "properties": {
+        "repo": { "type": "string", "description": "Full repo name (org/repo)" },
+        "pr_number": { "type": "integer" },
+        "focus_areas": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional areas to focus review on"
+        }
       }
-    }
-  },
-  "result_schema": {
-    "type": "object",
-    "required": ["approved", "comments"],
-    "properties": {
-      "approved": { "type": "boolean" },
-      "comments": { "type": "array" },
-      "severity": { "enum": ["clean", "minor", "major", "critical"] }
+    },
+    "result_schema": {
+      "type": "object",
+      "required": ["approved", "comments"],
+      "properties": {
+        "approved": { "type": "boolean" },
+        "comments": { "type": "array" },
+        "severity": { "enum": ["clean", "minor", "major", "critical"] }
+      }
     }
   }
 }
 ```
 
-When task is created with type `code_review`, payload is validated against schema.
-When task is completed, result is validated against result_schema.
-Validation failure → 422 with clear error message.
+When a task is created with type `code_review`, payload is validated against the matching contract's `payload_schema` via `TaskContractService`.
+When a task is completed, result is validated against `result_schema`.
+Validation failure → 422 with clear error message (`ContractViolationException`).
 
-Optional — task types without schema work as before (no validation).
-
-#### Discovery
-
-Agents can discover what task types exist and what they expect:
-
-```
-GET /api/v1/config/task-types
-
-GET /api/v1/config/task-types/code_review
-```
-
-This becomes the **task catalog** — complements service catalog from Service Workers doc.
+Optional — task types without a contract work as before (no validation).
 
 #### Schema
 
 ```sql
-CREATE TABLE task_types (
-    id              VARCHAR(26) PRIMARY KEY,
-    apiary_id       VARCHAR(26) NOT NULL,
-    hive_id         VARCHAR(26) NOT NULL,
-    type            VARCHAR(100) NOT NULL,
-    description     TEXT,
-    payload_schema  JSONB,
-    result_schema   JSONB,
-    created_by      VARCHAR(26),
-    created_at      TIMESTAMP DEFAULT NOW(),
-    updated_at      TIMESTAMP DEFAULT NOW(),
-    UNIQUE(hive_id, type)
-);
+-- No separate task_types table. Contracts live on the hive:
+ALTER TABLE hives ADD COLUMN task_contracts JSONB;
 ```
+
+> **Design note:** Storing contracts as a JSONB column on the `hives` table
+> avoids a separate table join and keeps contract definitions co-located with
+> the hive configuration. The `TaskContractService` reads `hive.task_contracts`
+> on task creation and completion to perform schema validation.
 
 ---
 
@@ -723,29 +762,40 @@ Agent token leaked. Current: delete agent, re-register, lose all in-flight tasks
 #### Design
 
 ```json
-POST /api/v1/agents/{id}/rotate-token
+POST /api/v1/agents/key/rotate
 {
-  "grace_period_seconds": 300
+  "grace_period_minutes": 5
 }
 ```
+
+This endpoint is agent-authenticated (no `{id}` in path — the agent rotates its own key).
 
 Response:
 
 ```json
 {
   "new_token": "tok_new_xxxxx",
-  "old_token_expires_at": "2025-02-20T12:05:00Z",
+  "key_grace_period_expires_at": "2025-02-20T12:05:00Z",
   "message": "Old token valid for 5 more minutes"
 }
 ```
 
 Both tokens work during grace period. After expiry, old token returns 401.
 
-Implementation: `agents` table gets `previous_token_hash` + `previous_token_expires_at`. Auth middleware checks both.
+**Additional endpoints:**
+
+```
+POST /api/v1/agents/key/rotate  — Rotate API key (agent-authenticated)
+POST /api/v1/agents/key/revoke  — Revoke current key immediately
+GET  /api/v1/agents/key/status  — Check key status (rotation in progress, grace period, etc.)
+```
+
+Implementation: `agents` table gets `previous_api_token_hash` + `key_grace_period_expires_at` + `key_rotated_at`. Auth middleware checks both hashes.
 
 ```sql
-ALTER TABLE agents ADD COLUMN previous_token_hash VARCHAR(255);
-ALTER TABLE agents ADD COLUMN previous_token_expires_at TIMESTAMP;
+ALTER TABLE agents ADD COLUMN previous_api_token_hash       VARCHAR(255);
+ALTER TABLE agents ADD COLUMN key_grace_period_expires_at   TIMESTAMP;
+ALTER TABLE agents ADD COLUMN key_rotated_at                TIMESTAMP;
 ```
 
 ---
@@ -758,39 +808,28 @@ One rogue agent creates 10,000 tasks per second. Swamps the queue for everyone.
 
 #### Design
 
-Rate limits set per agent or per capability pool:
+Rate limiting is implemented as a **single `rate_limit_per_minute`** column on the `agents` table. This applies a unified request-per-minute cap across all API actions for that agent.
+
+```sql
+ALTER TABLE agents ADD COLUMN rate_limit_per_minute UNSIGNED INT;  -- NULL = unlimited
+```
+
+When set, all API requests from the agent are counted against this single limit using a Redis sliding window counter. Exceeded → 429 with `Retry-After` header.
 
 ```json
-// In agent registration or via config
+// Example: set an agent's rate limit
+PUT /api/v1/agents/rate-limit
 {
-  "rate_limits": {
-    "tasks_create": { "per_minute": 60 },
-    "proxy_requests": { "per_minute": 120 },
-    "knowledge_writes": { "per_minute": 30 }
-  }
+  "rate_limit_per_minute": 120
 }
 ```
 
-Defaults from hive settings:
+If `rate_limit_per_minute` is `NULL`, no rate limit is enforced (unlimited).
 
-```json
-// hives.settings JSONB
-{
-  "agent_rate_limits": {
-    "_default": {
-      "tasks_create": { "per_minute": 100 },
-      "proxy_requests": { "per_minute": 200 },
-      "knowledge_writes": { "per_minute": 50 }
-    },
-    "capability:scanner": {
-      "proxy_requests": { "per_minute": 500 }
-    }
-  }
-}
-```
-
-Implementation: Redis sliding window counter per agent per action.
-Exceeded → 429 with `retry_after` header.
+> **Simplification note:** The original spec described per-action limits
+> (`tasks_create`, `proxy_requests`, `knowledge_writes`). The implementation
+> uses a single unified limit per agent for simplicity. Per-action limits may
+> be added in a future iteration if needed.
 
 ---
 
@@ -823,16 +862,16 @@ Sandbox hive behavior:
 - Activity log tagged with `sandbox: true`
 - No usage metering (Cloud — doesn't count against quotas)
 
-**Dry-run for policies:**
+**Task dry-run endpoint:**
+
+The `TaskDryRunService` validates and simulates a task submission without persisting anything. It runs the full validation pipeline (contract + capacity) and returns what would happen:
 
 ```json
-POST /api/v1/config/policies/evaluate
+POST /api/v1/hives/{hive}/tasks/dry-run
 {
-  "agent_id": "agt_reviewer",
-  "service_id": "svc_github",
-  "method": "PUT",
-  "path": "/repos/acme/backend/pulls/42/merge",
-  "dry_run": true
+  "type": "code_review",
+  "target_capability": "code_review",
+  "payload": { "repo": "acme/backend", "pr_number": 42 }
 }
 ```
 
@@ -840,45 +879,16 @@ Response:
 
 ```json
 {
-  "decision": "require_approval",
-  "matched_rule": { "method": "PUT", "path": "*/merge" },
-  "would_create_approval": true,
+  "valid": true,
+  "contract_match": "code_review",
+  "would_create_task": true,
   "dry_run": true
 }
 ```
 
-**Dry-run for webhook routes:**
-
-```json
-POST /api/v1/config/webhook-routes/evaluate
-{
-  "service": "github",
-  "event_type": "issue_comment.created",
-  "payload": { "repo": "acme/backend", "comment": "@bot review this" },
-  "dry_run": true
-}
-```
-
-Response:
-
-```json
-{
-  "matched_routes": [
-    {
-      "route_id": "rt_abc",
-      "name": "Bot mentions",
-      "would_create_task": {
-        "type": "code_review",
-        "target_capability": "code_review",
-        "hive": "backend"
-      }
-    }
-  ],
-  "unmatched_routes": [
-    { "route_id": "rt_def", "reason": "field_filter: repo NOT IN allowed list" }
-  ]
-}
-```
+> **Not yet implemented:** Policy evaluate dry-run (`POST /api/v1/config/policies/evaluate`)
+> and webhook-route evaluate dry-run (`POST /api/v1/config/webhook-routes/evaluate`)
+> are planned for a future iteration.
 
 ---
 
@@ -952,24 +962,30 @@ Agents can use `llm_hint` to decide which model to use. Platform tracks whether 
 #### Schema
 
 ```sql
-CREATE TABLE llm_usage (
-    id              BIGSERIAL PRIMARY KEY,
-    apiary_id       VARCHAR(26) NOT NULL,
-    hive_id         VARCHAR(26) NOT NULL,
-    agent_id        VARCHAR(26) NOT NULL,
-    task_id         VARCHAR(26),
+CREATE TABLE llm_usage_logs (
+    id                  VARCHAR(26) PRIMARY KEY,   -- ULID
+    apiary_id           VARCHAR(26) NOT NULL REFERENCES apiaries(id),
+    hive_id             VARCHAR(26) REFERENCES hives(id),
+    agent_id            VARCHAR(26) REFERENCES agents(id),
+    task_id             VARCHAR(26) REFERENCES tasks(id),
+    persona_id          VARCHAR(26),               -- marketplace persona, if applicable
     
-    model           VARCHAR(100),
-    input_tokens    INTEGER NOT NULL DEFAULT 0,
-    output_tokens   INTEGER NOT NULL DEFAULT 0,
-    total_requests  INTEGER NOT NULL DEFAULT 0,
-    estimated_cost  DECIMAL(10,6),
+    model               VARCHAR(100) NOT NULL,
+    provider            VARCHAR(50) NOT NULL,      -- openai, anthropic, etc.
+    prompt_tokens       UNSIGNED INT NOT NULL,
+    completion_tokens   UNSIGNED INT NOT NULL,
+    total_tokens        UNSIGNED INT NOT NULL,
+    cost_usd            DECIMAL(10,6) NOT NULL,
+    latency_ms          UNSIGNED INT,              -- request latency
     
-    created_at      TIMESTAMP DEFAULT NOW()
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_llm_usage_agent ON llm_usage (agent_id, created_at DESC);
-CREATE INDEX idx_llm_usage_hive ON llm_usage (hive_id, created_at DESC);
+CREATE INDEX idx_llm_usage_logs_apiary ON llm_usage_logs (apiary_id, created_at);
+CREATE INDEX idx_llm_usage_logs_hive   ON llm_usage_logs (hive_id, created_at);
+CREATE INDEX idx_llm_usage_logs_agent  ON llm_usage_logs (agent_id);
+CREATE INDEX idx_llm_usage_logs_task   ON llm_usage_logs (task_id);
 ```
 
 ---
@@ -1048,7 +1064,7 @@ Replay needs recorded proxy responses — store response bodies in proxy_log (or
 
 ---
 
-### 13. Agent Templates / Marketplace
+### 13. Marketplace Personas (Agent Templates)
 
 #### Problem
 
@@ -1057,7 +1073,7 @@ Connector Marketplace exists but agents are harder to set up than connectors.
 
 #### Design
 
-**Agent Template** — a package that includes everything:
+**Marketplace Persona** — a package that includes everything needed to deploy a pre-configured agent:
 
 ```yaml
 # marketplace/templates/github-code-reviewer.yaml
@@ -1136,22 +1152,26 @@ Marketplace → "GitHub Code Reviewer" → [Install]
 #### Schema
 
 ```sql
-CREATE TABLE agent_templates (
-    id              VARCHAR(26) PRIMARY KEY,
+CREATE TABLE marketplace_personas (
+    id              VARCHAR(26) PRIMARY KEY,    -- ULID
+    apiary_id       VARCHAR(26) NOT NULL,
     name            VARCHAR(255) NOT NULL,
     slug            VARCHAR(100) NOT NULL UNIQUE,
     description     TEXT,
-    readme          TEXT,
-    manifest        JSONB NOT NULL,             -- full YAML converted to JSON
-    version         VARCHAR(20) NOT NULL,
-    author_user_id  BIGINT REFERENCES users(id),
+    documents       JSONB DEFAULT '{}',         -- readme, changelog, etc.
+    config          JSONB,                      -- full manifest (YAML converted to JSON)
+    visibility      VARCHAR(20) DEFAULT 'private',  -- 'public' or 'private'
+    tags            JSONB,
     category        VARCHAR(50),                -- code_review, devops, data, monitoring
-    downloads       INTEGER DEFAULT 0,
-    rating          DECIMAL(3,2) DEFAULT 0,
-    status          VARCHAR(20) DEFAULT 'pending',
+    install_count   UNSIGNED INT DEFAULT 0,
+    is_featured     BOOLEAN DEFAULT FALSE,
+    created_by_id   VARCHAR(26),
     created_at      TIMESTAMP DEFAULT NOW(),
     updated_at      TIMESTAMP DEFAULT NOW()
 );
+
+CREATE INDEX idx_marketplace_personas_visibility ON marketplace_personas (visibility, name);
+CREATE INDEX idx_marketplace_personas_category   ON marketplace_personas (category);
 ```
 
 ---
@@ -1172,7 +1192,7 @@ CREATE TABLE agent_templates (
 | 10 | Sandbox / dry-run        | 3     | 1 week  | High   |
 | 11 | LLM-aware features       | 4     | 2 weeks | High   |
 | 12 | Task replay              | 4     | 1 week  | Medium |
-| 13 | Agent template marketplace| 4    | 2 weeks | High   |
+| 13 | Marketplace personas      | 4    | 2 weeks | High   |
 
 ---
 

@@ -311,3 +311,86 @@ class TestPollTasksWithMeta:
         with ApiaryClient(BASE_URL, token=TOKEN) as c:
             envelope_result = c.poll_tasks_with_meta(HIVE_ID)
         assert envelope_result["meta"]["persona_version"] is None
+
+    def test_poll_tasks_with_meta_includes_platform_context_version(self, httpx_mock):
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
+            json={
+                "data": [],
+                "meta": {"total": 0, "persona_version": 1, "platform_context_version": 2},
+                "errors": None,
+            },
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            envelope_result = c.poll_tasks_with_meta(HIVE_ID)
+        assert envelope_result["meta"]["platform_context_version"] == 2
+
+    def test_poll_tasks_with_meta_platform_context_version_none(self, httpx_mock):
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
+            json={
+                "data": [],
+                "meta": {"total": 0, "persona_version": 1, "platform_context_version": None},
+                "errors": None,
+            },
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            envelope_result = c.poll_tasks_with_meta(HIVE_ID)
+        assert envelope_result["meta"]["platform_context_version"] is None
+
+
+class TestGetPersonaVersionPlatformContext:
+    """Tests for known_platform_version in get_persona_version and check_persona_version."""
+
+    def test_get_persona_version_with_known_platform_version(self, httpx_mock):
+        data = {"version": 3, "platform_context_version": 2, "changed": False}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version(known_version=3, known_platform_version=2)
+        assert result["version"] == 3
+        assert result["platform_context_version"] == 2
+        assert result["changed"] is False
+
+    def test_get_persona_version_platform_change_triggers_changed(self, httpx_mock):
+        data = {"version": 3, "platform_context_version": 5, "changed": True}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version(known_version=3, known_platform_version=2)
+        assert result["changed"] is True
+        assert result["platform_context_version"] == 5
+
+    def test_get_persona_version_includes_platform_context_version_without_known(self, httpx_mock):
+        data = {"version": 3, "platform_context_version": 1}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            result = c.get_persona_version()
+        assert result["platform_context_version"] == 1
+
+    def test_check_persona_version_with_known_platform_version_unchanged(self, httpx_mock):
+        data = {"version": 3, "platform_context_version": 2, "changed": False}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            changed = c.check_persona_version(known_version=3, known_platform_version=2)
+        assert changed is False
+
+    def test_check_persona_version_with_known_platform_version_changed(self, httpx_mock):
+        data = {"version": 3, "platform_context_version": 5, "changed": True}
+        httpx_mock.add_response(
+            url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
+            json=envelope(data),
+        )
+        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+            changed = c.check_persona_version(known_version=3, known_platform_version=2)
+        assert changed is True

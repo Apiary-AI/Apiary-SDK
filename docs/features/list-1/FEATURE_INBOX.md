@@ -27,7 +27,7 @@ For these cases, the full connector + route setup is friction that slows adoptio
 An **Inbox** is a simple, pre-authenticated URL that converts any POST into a task.
 
 ```
-POST https://acme.apiary.ai/inbox/inb_k7Xm9pQ2
+POST https://acme.apiary.ai/inbox/inb_a1B2c3D4e5F6
 
 { "server": "web-03", "alert": "CPU > 95%", "severity": "high" }
 
@@ -36,6 +36,8 @@ POST https://acme.apiary.ai/inbox/inb_k7Xm9pQ2
 
 No connector. No route config. No signature validation.
 Just URL → task.
+
+**ID vs Slug:** Every inbox has two identifiers. The **id** is a standard 26-character ULID (like all Apiary resources). The **slug** is a URL-safe string prefixed `inb_` followed by 12 random characters (e.g. `inb_a1B2c3D4e5F6`). The public receiver URL uses the slug — it is what you copy/paste into external services. The id is what the API returns for management operations (list, show, update, delete).
 
 ## 3. How It Works
 
@@ -46,13 +48,12 @@ Dashboard: Hive → Inboxes → "New Inbox"
 Or via API:
 
 ```json
-POST /api/v1/inboxes
+POST /api/v1/hives/{hive}/inboxes
 {
   "name": "CI Pipeline Alerts",
-  "target_hive": "backend",
   "task_type": "ci_alert",
   "target_capability": "ops",
-  "priority": "high",
+  "priority": 3,
   "description": "Receives POST from GitHub Actions on failure"
 }
 ```
@@ -61,22 +62,26 @@ Response:
 
 ```json
 {
-  "inbox_id": "inb_k7Xm9pQ2",
-  "url": "https://acme.apiary.ai/inbox/inb_k7Xm9pQ2",
+  "id": "01HQXK5V8N3YGT4P9RZM6WJCBA",
+  "apiary_id": "01HQXK5V8N3YGT4P9RZM6WJAAA",
+  "hive_id": "01HQXK5V8N3YGT4P9RZM6WJBBB",
   "name": "CI Pipeline Alerts",
+  "slug": "inb_a1B2c3D4e5F6",
   "task_type": "ci_alert",
-  "target_hive": "backend",
-  "status": "active",
-  "created_at": "2025-02-20T10:00:00Z"
+  "target_capability": "ops",
+  "priority": 3,
+  "is_active": true,
+  "created_at": "2025-02-20T10:00:00Z",
+  "updated_at": "2025-02-20T10:00:00Z"
 }
 ```
 
-Copy the URL, paste it wherever you need.
+The `id` is the ULID used for management API calls. The `slug` is what goes in the public URL — copy `https://acme.apiary.ai/inbox/inb_a1B2c3D4e5F6` and paste it wherever you need.
 
 ### 3.2 Send Data to Inbox
 
 ```
-POST /inbox/inb_k7Xm9pQ2
+POST /inbox/inb_a1B2c3D4e5F6
 Content-Type: application/json
 
 {
@@ -113,15 +118,11 @@ The entire POST body becomes the task payload, wrapped with inbox metadata:
   "status": "pending",
   "payload": {
     "_inbox": {
-      "inbox_id": "inb_k7Xm9pQ2",
+      "inbox_id": "01HQXK5V8N3YGT4P9RZM6WJCBA",
       "inbox_name": "CI Pipeline Alerts",
       "received_at": "2025-02-20T12:34:56Z",
       "source_ip": "140.82.112.1",
-      "content_type": "application/json",
-      "headers": {
-        "user-agent": "GitHub-Hookshot/abc123",
-        "x-github-event": "workflow_run"
-      }
+      "content_type": "application/json"
     },
     "_body": {
       "repo": "acme/backend",
@@ -145,7 +146,7 @@ Agent receives the full context and decides what to do.
 ### 4.1 Minimal (zero config)
 
 ```json
-POST /api/v1/inboxes
+POST /api/v1/hives/{hive}/inboxes
 {
   "name": "Quick Webhook"
 }
@@ -157,10 +158,9 @@ Any agent can pick it up.
 ### 4.2 Full Config
 
 ```json
-POST /api/v1/inboxes
+POST /api/v1/hives/{hive}/inboxes
 {
   "name": "Production Alerts",
-  "target_hive": "infrastructure",
   "task_type": "production_alert",
   "target_capability": "incident_response",
   "target_agent_id": null,
@@ -267,7 +267,7 @@ Inboxes support three security levels. Pick what fits your use case.
 
 ### Tier 1: URL-only (default)
 
-The inbox URL contains a random ID (`inb_k7Xm9pQ2`). Knowing the URL = authorized.
+The inbox URL contains a random slug (`inb_a1B2c3D4e5F6`). Knowing the URL = authorized.
 Good for: internal tools, prototyping, trusted sources.
 
 ```json
@@ -400,11 +400,11 @@ Uses the same idempotency key infrastructure from FEATURE_TASK_SEMANTICS.
 
 ```sql
 CREATE TABLE inboxes (
-    id              VARCHAR(26) PRIMARY KEY,     -- inb_xxx
+    id              VARCHAR(26) PRIMARY KEY,     -- ULID
     apiary_id       VARCHAR(26) NOT NULL REFERENCES apiaries(id),
     hive_id         VARCHAR(26) NOT NULL REFERENCES hives(id),
     name            VARCHAR(255) NOT NULL,
-    slug            VARCHAR(100) NOT NULL,       -- URL-safe identifier
+    slug            VARCHAR(100) NOT NULL,       -- URL-safe identifier (inb_ + 12 random chars)
     description     TEXT,
     
     -- Task creation config
@@ -452,38 +452,41 @@ Lightweight request log for debugging and dashboard:
 ```sql
 CREATE TABLE inbox_log (
     id              BIGSERIAL PRIMARY KEY,
-    inbox_id        VARCHAR(26) NOT NULL REFERENCES inboxes(id),
-    apiary_id       VARCHAR(26) NOT NULL,
+    apiary_id       VARCHAR(26) NOT NULL REFERENCES apiaries(id) ON DELETE CASCADE,
     hive_id         VARCHAR(26) NOT NULL,
-    
-    task_id         VARCHAR(26) REFERENCES tasks(id),  -- null if rejected
-    source_ip       INET,
-    content_type    VARCHAR(100),
-    payload_size    INTEGER,
-    
-    status          VARCHAR(20) NOT NULL,    -- accepted, rejected, rate_limited, deduplicated, invalid
-    reject_reason   VARCHAR(255),            -- "invalid_signature", "rate_limit", "payload_too_large"
-    
+    inbox_id        VARCHAR(26) NOT NULL,
+    task_id         VARCHAR(26),                -- null if rejected
+    slug            VARCHAR(80) NOT NULL,       -- slug at the time of the request
+    status_code     SMALLINT NOT NULL,          -- HTTP response code (201, 200, 401, 403, 409, 413, 429)
+    outcome         VARCHAR(30) NOT NULL,       -- 'success', 'duplicate', 'auth_failed', 'rate_limited', 'rejected', 'ip_blocked', 'dedup_contention'
+    error_code      VARCHAR(50),                -- e.g. 'invalid_signature', 'payload_too_large', 'dedup_lock_contention'
+    source_ip       VARCHAR(45) NOT NULL,       -- supports IPv4 and IPv6
+    content_length  INTEGER UNSIGNED,           -- bytes, nullable
+    duration_ms     INTEGER UNSIGNED,           -- request processing time, nullable
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
-CREATE INDEX idx_inbox_log_inbox ON inbox_log (inbox_id, created_at DESC);
-CREATE INDEX idx_inbox_log_apiary ON inbox_log (apiary_id, created_at DESC);
+CREATE INDEX idx_inbox_log_apiary ON inbox_log (apiary_id, created_at);
+CREATE INDEX idx_inbox_log_hive ON inbox_log (hive_id, created_at);
+CREATE INDEX idx_inbox_log_inbox ON inbox_log (inbox_id, created_at);
 ```
 
 ## 10. API
 
 ### 10.1 Inbox Management
 
+All management endpoints are hive-scoped and require agent authentication:
+
 ```
-POST   /api/v1/inboxes              — Create inbox
-GET    /api/v1/inboxes              — List inboxes in current hive
-GET    /api/v1/inboxes/{id}         — Get inbox details + stats
-PATCH  /api/v1/inboxes/{id}         — Update config
-DELETE /api/v1/inboxes/{id}         — Deactivate inbox
-POST   /api/v1/inboxes/{id}/rotate  — Rotate slug (new URL, old stops working)
-GET    /api/v1/inboxes/{id}/log     — Recent request log
+POST   /api/v1/hives/{hive}/inboxes                    — Create inbox
+GET    /api/v1/hives/{hive}/inboxes                    — List inboxes in hive
+GET    /api/v1/hives/{hive}/inboxes/{inbox}            — Get inbox details + stats
+PUT    /api/v1/hives/{hive}/inboxes/{inbox}            — Update config
+DELETE /api/v1/hives/{hive}/inboxes/{inbox}            — Delete inbox
+POST   /api/v1/hives/{hive}/inboxes/{inbox}/rotate-slug — Rotate slug (new URL, old stops working)
 ```
+
+The `{inbox}` parameter is the inbox **id** (ULID), not the slug.
 
 ### 10.2 Inbox Receiver (public, no auth)
 
@@ -495,10 +498,10 @@ No API token needed. The slug itself is the auth (Tier 1) or signature validates
 
 ### 10.3 Agent-Created Inboxes
 
-Agents with `manage:inboxes` permission can create inboxes via API:
+Agents with `inboxes.write` permission can create inboxes via API:
 
 ```json
-POST /api/v1/inboxes
+POST /api/v1/hives/{hive}/inboxes
 {
   "name": "My CI Listener",
   "task_type": "ci_event",
@@ -518,7 +521,7 @@ Use case: agent bootstraps its own infrastructure — "I need a webhook URL for 
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  🟢 CI Pipeline Alerts          ci_alert → ops             │
-│     https://acme.apiary.ai/inbox/inb_k7Xm9pQ2    [Copy]   │
+│     https://acme.apiary.ai/inbox/inb_a1B2c3D4e5F6 [Copy]   │
 │     1,247 requests · last: 2 min ago                        │
 │                                                             │
 │  🟢 PagerDuty Bridge            production_alert → infra   │
@@ -556,7 +559,7 @@ Step 2: "Which agent handles it?"
   → capability selector or specific agent
 
 Step 3: Here's your URL
-  https://acme.apiary.ai/inbox/inb_k7Xm9pQ2  [Copy]
+  https://acme.apiary.ai/inbox/inb_a1B2c3D4e5F6  [Copy]
   
   "Paste this URL in your CI config / monitoring tool / Zapier"
   
@@ -615,7 +618,7 @@ public function receive(string $slug, Request $request)
             'inbox_name' => $inbox->name,
             'received_at' => now()->toIso8601String(),
             'source_ip' => $request->ip(),
-            'content_type' => $request->getContentType(),
+            'content_type' => $request->header('Content-Type'),
         ],
         '_body' => $request->json()->all(),
     ];
@@ -671,6 +674,7 @@ Inbox accepts any Content-Type:
 | 401  | Invalid signature                         |
 | 403  | IP not allowed                            |
 | 404  | Inbox not found or inactive               |
+| 409  | Deduplication lock contention — concurrent requests with the same dedup key collided; client should retry after the `retry_after` value in the response |
 | 413  | Payload too large                         |
 | 429  | Rate limited                              |
 
@@ -678,7 +682,8 @@ Inbox accepts any Content-Type:
 
 | Permission          | Who           | What                                |
 |---------------------|---------------|-------------------------------------|
-| `manage:inboxes`    | Agent         | Create/update/delete inboxes via API|
+| `inboxes.read`      | Agent         | List/show inboxes via API           |
+| `inboxes.write`     | Agent         | Create/update/delete inboxes via API|
 | Admin/Member role   | Dashboard user| Full inbox management               |
 | Viewer role         | Dashboard user| View inbox list + logs              |
 | (none)              | External      | POST to inbox URL                   |
