@@ -1,5 +1,10 @@
 # TASK-233: Hosted agent lifecycle API (start / stop / restart / scale / destroy)
 
+> **Post-merge correction (2026-04-19):** references to `SUPERPOS_TOKEN`
+> in this doc should be read as `SUPERPOS_API_TOKEN`; the env var was
+> unified post-merge to match the Python SDK's `from_env()` contract
+> (see TASK-256).
+
 **Status:** pending
 **Branch:** `task/233-hosted-agent-lifecycle-api`
 **PR:** —
@@ -36,7 +41,7 @@ enqueues the matching job; the jobs do the novps round-trips and reconcile
   `DestroyHostedAgentJob` here. Job: calls
   `NovpsClient::deleteApp($appId)`, on success soft-deletes the
   `hosted_agents` row by setting `status = deleted` and nulling
-  `novps_*` handles, revokes the agent's `APIARY_TOKEN`, and archives
+  `novps_*` handles, revokes the agent's `SUPERPOS_API_TOKEN`, and archives
   the underlying `Agent` record (`is_archived = true`).
 - [ ] FR-6: All endpoints return 202 with the updated resource + the
   queued job's name. Dashboard polls `GET /status` (TASK-228) for
@@ -54,7 +59,7 @@ enqueues the matching job; the jobs do the novps round-trips and reconcile
   convergence target, not the transition verb.
 - [ ] NFR-2: On `deleteApp` 404 (already gone remotely), treat as
   successful destroy and converge DB state regardless.
-- [ ] NFR-3: No lifecycle op may leak `APIARY_TOKEN` or `user_env` through
+- [ ] NFR-3: No lifecycle op may leak `SUPERPOS_API_TOKEN` or `user_env` through
   logs / activity_log / API response.
 
 ## Architecture & Design
