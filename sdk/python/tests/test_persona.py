@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from apiary_sdk import ApiaryClient
+from superpos_sdk import SuperposClient
 
 from .conftest import BASE_URL, HIVE_ID, TOKEN, envelope
 
@@ -33,7 +33,7 @@ class TestGetPersona:
             url=f"{BASE_URL}/api/v1/persona",
             json=envelope(_persona_data()),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             persona = c.get_persona()
         assert persona["version"] == 1
         assert persona["documents"]["SOUL"] == "You are a helpful assistant."
@@ -46,7 +46,7 @@ class TestGetPersonaConfig:
             url=f"{BASE_URL}/api/v1/persona/config",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_config()
         assert result["version"] == 1
         assert result["config"]["model"] == "gpt-4"
@@ -59,7 +59,7 @@ class TestGetPersonaDocument:
             url=f"{BASE_URL}/api/v1/persona/documents/SOUL",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_document("SOUL")
         assert result["document"] == "SOUL"
         assert result["content"] == "You are a helpful assistant."
@@ -76,7 +76,7 @@ class TestGetPersonaAssembled:
             url=f"{BASE_URL}/api/v1/persona/assembled",
             json=envelope(assembled),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_assembled()
         assert result["prompt"].startswith("SOUL:")
         assert result["document_count"] == 2
@@ -89,7 +89,7 @@ class TestUpdatePersonaDocument:
             url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_persona_document(
                 "MEMORY", content="Updated memory.", message="learned new fact"
             )
@@ -106,7 +106,7 @@ class TestUpdatePersonaDocument:
             url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_persona_document("MEMORY", content="Bare update.")
         assert result["version"] == 1
         assert result["document"] == "MEMORY"
@@ -122,7 +122,7 @@ class TestUpdatePersonaDocument:
             url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_persona_document("MEMORY", content="new fact", mode="append")
         assert result["content"] == "old\nnew fact"
         body = json.loads(httpx_mock.get_request().content)
@@ -135,14 +135,14 @@ class TestUpdatePersonaDocument:
             url=f"{BASE_URL}/api/v1/persona/documents/MEMORY",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_persona_document("MEMORY", content="preamble", mode="prepend")
         assert result["content"] == "preamble\nold"
         body = json.loads(httpx_mock.get_request().content)
         assert body["mode"] == "prepend"
 
     def test_update_invalid_mode_raises(self):
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             with pytest.raises(ValueError, match="Invalid mode"):
                 c.update_persona_document("MEMORY", content="x", mode="overwrite")
 
@@ -156,7 +156,7 @@ class TestUpdateMemory:
             url=f"{BASE_URL}/api/v1/persona/memory",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_memory(content="new fact")
         assert result["version"] == 2
         assert result["document"] == "MEMORY"
@@ -171,7 +171,7 @@ class TestUpdateMemory:
             url=f"{BASE_URL}/api/v1/persona/memory",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_memory(content="new fact", message="schema discovery")
         assert result["version"] == 2
         body = json.loads(httpx_mock.get_request().content)
@@ -183,7 +183,7 @@ class TestUpdateMemory:
             url=f"{BASE_URL}/api/v1/persona/memory",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_memory(content="fresh slate", mode="replace")
         assert result["content"] == "fresh slate"
         body = json.loads(httpx_mock.get_request().content)
@@ -195,14 +195,14 @@ class TestUpdateMemory:
             url=f"{BASE_URL}/api/v1/persona/memory",
             json=envelope(doc),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.update_memory(content="preamble", mode="prepend")
         assert result["content"] == "preamble\nold"
         body = json.loads(httpx_mock.get_request().content)
         assert body["mode"] == "prepend"
 
     def test_update_memory_invalid_mode_raises(self):
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             with pytest.raises(ValueError, match="Invalid mode"):
                 c.update_memory(content="x", mode="overwrite")
 
@@ -216,7 +216,7 @@ class TestGetPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version()
         assert result["version"] == 3
         assert "changed" not in result
@@ -227,7 +227,7 @@ class TestGetPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version(known_version=3)
         assert result["version"] == 3
         assert result["changed"] is False
@@ -238,7 +238,7 @@ class TestGetPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version(known_version=3)
         assert result["changed"] is True
 
@@ -248,7 +248,7 @@ class TestGetPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version()
         assert result["version"] is None
 
@@ -262,7 +262,7 @@ class TestCheckPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             changed = c.check_persona_version(known_version=2)
         assert changed is False
 
@@ -272,7 +272,7 @@ class TestCheckPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             changed = c.check_persona_version(known_version=2)
         assert changed is True
 
@@ -283,7 +283,7 @@ class TestCheckPersonaVersion:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=1",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             changed = c.check_persona_version(known_version=1)
         assert changed is False
 
@@ -297,7 +297,7 @@ class TestPollTasksWithMeta:
             url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
             json={"data": tasks, "meta": {"total": 1, "persona_version": 3}, "errors": None},
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             envelope_result = c.poll_tasks_with_meta(HIVE_ID)
         assert envelope_result["data"] == tasks
         assert envelope_result["meta"]["persona_version"] == 3
@@ -308,7 +308,7 @@ class TestPollTasksWithMeta:
             url=f"{BASE_URL}/api/v1/hives/{HIVE_ID}/tasks/poll",
             json={"data": [], "meta": {"total": 0, "persona_version": None}, "errors": None},
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             envelope_result = c.poll_tasks_with_meta(HIVE_ID)
         assert envelope_result["meta"]["persona_version"] is None
 
@@ -321,7 +321,7 @@ class TestPollTasksWithMeta:
                 "errors": None,
             },
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             envelope_result = c.poll_tasks_with_meta(HIVE_ID)
         assert envelope_result["meta"]["platform_context_version"] == 2
 
@@ -334,7 +334,7 @@ class TestPollTasksWithMeta:
                 "errors": None,
             },
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             envelope_result = c.poll_tasks_with_meta(HIVE_ID)
         assert envelope_result["meta"]["platform_context_version"] is None
 
@@ -348,7 +348,7 @@ class TestGetPersonaVersionPlatformContext:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version(known_version=3, known_platform_version=2)
         assert result["version"] == 3
         assert result["platform_context_version"] == 2
@@ -360,7 +360,7 @@ class TestGetPersonaVersionPlatformContext:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version(known_version=3, known_platform_version=2)
         assert result["changed"] is True
         assert result["platform_context_version"] == 5
@@ -371,7 +371,7 @@ class TestGetPersonaVersionPlatformContext:
             url=f"{BASE_URL}/api/v1/persona/version",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             result = c.get_persona_version()
         assert result["platform_context_version"] == 1
 
@@ -381,7 +381,7 @@ class TestGetPersonaVersionPlatformContext:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             changed = c.check_persona_version(known_version=3, known_platform_version=2)
         assert changed is False
 
@@ -391,6 +391,6 @@ class TestGetPersonaVersionPlatformContext:
             url=f"{BASE_URL}/api/v1/persona/version?known_version=3&known_platform_version=2",
             json=envelope(data),
         )
-        with ApiaryClient(BASE_URL, token=TOKEN) as c:
+        with SuperposClient(BASE_URL, token=TOKEN) as c:
             changed = c.check_persona_version(known_version=3, known_platform_version=2)
         assert changed is True
